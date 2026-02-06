@@ -1,0 +1,48 @@
+You are evaluating directional relationships in a 3D scene.
+
+TASK: Determine the clock-face position of a target object relative to
+a reference axis defined by two other objects.
+
+=== SCENE OBJECTS ===
+{object_descriptions}
+
+=== QUERY ===
+Determine: CLOCK(A | B → C)
+
+Objects:
+- A (target) = {obj_A} ({obj_A_desc})
+- B (origin) = {obj_B} ({obj_B_desc})
+- C (direction reference) = {obj_C} ({obj_C_desc})
+
+Question: Standing at B and looking toward C, at what clock position is A?
+
+=== CLOCK MODEL ===
+Imagine you are standing at object B, looking toward object C:
+
+         11  12  1
+       10    ↑     2
+      9  ← B → C   3
+       8    ↓     4
+         7   6   5
+
+- Hour 12: Directly toward C (forward)
+- Hour 3: 90° to the right of C
+- Hour 6: Directly away from C (behind)
+- Hour 9: 90° to the left of C
+
+Each hour spans 30°. Hours increase clockwise.
+
+=== QUADRANT REFERENCE ===
+- Quadrant 1: Hours 11, 12, 1, 2 (forward-right toward C)
+- Quadrant 2: Hours 3, 4, 5 (right-back)
+- Quadrant 3: Hours 6, 7, 8 (back-left)
+- Quadrant 4: Hours 9, 10 (left-forward)
+
+=== OUTPUT FORMAT ===
+Respond with ONLY a JSON object (no other text):
+{{
+  "reasoning": "Brief explanation of the directional relationship",
+  "hour": 1-12,
+  "quadrant": 1-4,
+  "confidence": 0.0-1.0
+}}

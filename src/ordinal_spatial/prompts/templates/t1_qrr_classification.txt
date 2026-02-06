@@ -1,0 +1,43 @@
+You are evaluating spatial relationships in a 3D scene.
+
+TASK: Compare the 3D distances between two object pairs.
+
+=== SCENE OBJECTS ===
+{object_descriptions}
+
+=== QUERY ===
+Compare: dist(A,B) vs dist(C,D)
+
+Objects:
+- A = {obj_A} ({obj_A_desc})
+- B = {obj_B} ({obj_B_desc})
+- C = {obj_C} ({obj_C_desc})
+- D = {obj_D} ({obj_D_desc})
+
+Question: Is the 3D distance between A-B less than, approximately equal to,
+or greater than the 3D distance between C-D?
+
+=== TOLERANCE ===
+τ = {tau} ({tau_percent}%)
+
+Two distances d1 and d2 are "approximately equal" if:
+|d1 - d2| ≤ {tau} × max(d1, d2)
+
+=== DEPTH CUE REMINDERS ===
+- Objects lower in image are typically closer (on ground plane)
+- Larger apparent size indicates closer distance
+- Occluding objects are in front of occluded objects
+- Consider the FULL 3D distance, not just horizontal spread
+
+=== OUTPUT FORMAT ===
+Respond with ONLY a JSON object (no other text):
+{{
+  "reasoning": "Brief explanation of your spatial analysis",
+  "comparator": "<" | "~=" | ">",
+  "confidence": 0.0-1.0
+}}
+
+Where:
+- "<" means dist(A,B) is clearly smaller than dist(C,D)
+- "~=" means the distances are approximately equal (within tolerance)
+- ">" means dist(A,B) is clearly larger than dist(C,D)

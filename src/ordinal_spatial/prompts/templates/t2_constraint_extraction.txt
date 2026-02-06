@@ -1,0 +1,109 @@
+You are extracting ordinal spatial constraints from a 3D scene.
+
+TASK: Extract a COMPLETE and EXHAUSTIVE set of ordinal constraints.
+
+=== STEP 1: OBJECT BINDING ===
+First, locate each object in the image and verify the binding:
+
+{object_list}
+
+Number of objects: {n_objects}
+
+IMPORTANT: Before extracting constraints, mentally verify you can identify each object:
+- Match each obj_id to a specific object you see in the image
+- Use the position hint (front/back, left/right) to help locate objects
+- Use color, size, material, and shape to confirm identification
+- If two objects look similar, use their relative positions to distinguish them
+
+=== STEP 2: DISTANCE RANKING ===
+CRITICAL: Before generating QRR constraints, you MUST:
+
+1. List ALL unique object pairs: For {n_objects} objects, there are {n_objects}*({n_objects}-1)/2 pairs
+2. Estimate the 3D distance for each pair (use depth cues: size perspective, occlusion, ground contact)
+3. RANK all pairs from shortest to longest distance
+4. Use this ranking to generate CONSISTENT comparisons
+
+Example for 4 objects (A,B,C,D):
+- Pairs: A-B, A-C, A-D, B-C, B-D, C-D (6 pairs)
+- Ranking: A-B < C-D < A-C < B-D < A-D < B-C
+- This ranking guides all QRR comparisons
+
+=== STEP 3: CONSTRAINT EXTRACTION ===
+
+1. QRR CONSTRAINTS (Quaternary Relative Relations) - EXTRACT ALL!
+   Compare 3D distances between DISJOINT object pairs.
+
+   Format: {{"pair1": ["A", "B"], "pair2": ["C", "D"], "metric": "dist3D", "comparator": "<|~=|>"}}
+
+   QUANTITY REQUIREMENT:
+   - For {n_objects} objects, you have P = {n_objects}*({n_objects}-1)/2 pairs
+   - Number of DISJOINT pair comparisons = P*(P-1)/2 - (overlapping pairs)
+   - For 6 objects: ~45 QRR constraints expected
+   - For 8 objects: ~315 QRR constraints expected
+   - You MUST output at least 80% of all possible disjoint QRR comparisons!
+
+   Rules:
+   - Only compare pairs with NO shared objects (disjoint)
+   - Use "<" if dist(pair1) is clearly smaller (ratio < 0.9)
+   - Use "~=" if distances are within tolerance τ = {tau} (ratio between 0.9 and 1.1)
+   - Use ">" if dist(pair1) is clearly larger (ratio > 1.1)
+
+   Distance estimation tips:
+   - Objects closer to camera (lower in image, larger apparent size) are CLOSER in 3D
+   - Objects higher in image and smaller are FARTHER in 3D
+   - Use ground plane positions to estimate true 3D distances
+   - Don't confuse 2D image distance with 3D spatial distance
+
+2. TRR CONSTRAINTS (Ternary Clock Relations)
+   Describe directional positions using clock-face model.
+
+   Format: {{"target": "A", "ref1": "B", "ref2": "C", "hour": 1-12}}
+
+   Interpretation: Standing at B, looking toward C, A is at hour X.
+   - 12 o'clock = directly toward C
+   - 3 o'clock = 90 degrees clockwise from C direction
+   - 6 o'clock = opposite to C
+   - 9 o'clock = 90 degrees counter-clockwise from C direction
+
+   QUANTITY: Output TRR for representative triples (at least 10 for 6+ objects)
+
+=== CONSISTENCY REQUIREMENTS ===
+Your constraints MUST be globally consistent:
+
+- Transitivity: If A-B < C-D and C-D < E-F, then A-B < E-F
+- No cycles: Cannot have A-B < C-D < E-F < A-B
+- Symmetry: If you say A-B < C-D, don't also say C-D < A-B
+
+The distance ranking from Step 2 automatically ensures consistency!
+
+=== OUTPUT FORMAT ===
+Respond with ONLY a JSON object (no other text):
+{{
+  "object_bindings": {{
+    "obj_0": "brief visual description",
+    "obj_1": "brief visual description",
+    ...
+  }},
+  "distance_ranking": [
+    ["obj_A", "obj_B"],
+    ["obj_C", "obj_D"],
+    ...
+  ],
+  "objects": ["obj_0", "obj_1", "obj_2", ...],
+  "qrr": [
+    {{"pair1": ["obj_A", "obj_B"], "pair2": ["obj_C", "obj_D"], "metric": "dist3D", "comparator": "<"}},
+    ... (MANY more constraints - aim for completeness!)
+  ],
+  "trr": [
+    {{"target": "obj_A", "ref1": "obj_B", "ref2": "obj_C", "hour": 2}},
+    ...
+  ],
+  "confidence": 0.0-1.0
+}}
+
+IMPORTANT REMINDERS:
+- The "distance_ranking" field lists pairs from SHORTEST to LONGEST distance
+- Output ALL disjoint QRR comparisons you can derive from the ranking
+- For {n_objects} objects, expect ~{n_objects}*({n_objects}-1)*({n_objects}-2)*({n_objects}-3)/8 QRR constraints
+- Missing constraints = lost recall = poor evaluation score
+- Be EXHAUSTIVE, not conservative!

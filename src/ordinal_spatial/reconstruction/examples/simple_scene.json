@@ -1,0 +1,32 @@
+{
+    "scene_id": "simple_scene_001",
+    "tau": 0.10,
+    "objects": [
+        {"id": "cube_red", "shape": "cube", "color": "red", "size": "large"},
+        {"id": "sphere_blue", "shape": "sphere", "color": "blue", "size": "medium"},
+        {"id": "cylinder_green", "shape": "cylinder", "color": "green", "size": "small"},
+        {"id": "cone_yellow", "shape": "cone", "color": "yellow", "size": "medium"}
+    ],
+    "constraints": {
+        "qrr": [
+            {
+                "pair1": ["cube_red", "sphere_blue"],
+                "pair2": ["cylinder_green", "cone_yellow"],
+                "metric": "DIST_3D",
+                "comparator": "<",
+                "difficulty": 3
+            }
+        ],
+        "axial": [
+            {"a": "cube_red", "b": "sphere_blue", "axis": "x", "relation": "left_of"},
+            {"a": "sphere_blue", "b": "cylinder_green", "axis": "x", "relation": "left_of"},
+            {"a": "cylinder_green", "b": "cone_yellow", "axis": "x", "relation": "left_of"},
+            {"a": "cube_red", "b": "cone_yellow", "axis": "z", "relation": "below"}
+        ],
+        "topology": [
+            {"obj1": "cube_red", "obj2": "sphere_blue", "relation": "disjoint"},
+            {"obj1": "sphere_blue", "obj2": "cylinder_green", "relation": "disjoint"},
+            {"obj1": "cylinder_green", "obj2": "cone_yellow", "relation": "disjoint"}
+        ]
+    }
+}

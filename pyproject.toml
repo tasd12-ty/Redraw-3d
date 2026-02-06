@@ -1,0 +1,68 @@
+[project]
+name = "ordinal-spatial"
+version = "0.1.0"
+description = "ORDINAL-SPATIAL: A benchmark for evaluating VLM ordinal spatial reasoning"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+authors = [
+  {name = "ORDINAL-SPATIAL Team"},
+]
+keywords = ["spatial-reasoning", "vlm", "benchmark", "blender", "clevr"]
+
+dependencies = [
+  "numpy>=1.21.0",
+  "scipy>=1.7.0",
+  "Pillow>=9.0.0",
+  "jsonschema>=4.0.0",
+  "pydantic>=2.0.0",
+  "networkx>=2.6.0",
+  "openai>=1.0.0",
+  "httpx[socks]>=0.24.0",
+  "matplotlib>=3.5.0",
+]
+
+[project.optional-dependencies]
+ml = [
+  "torch>=2.0.0",
+]
+tokenizer = [
+  "tiktoken>=0.5.0",
+  "transformers>=4.30.0",
+]
+viz = [
+  "seaborn>=0.12.0",
+  "plotly>=5.0.0",
+]
+test = [
+  "pytest>=7.0.0",
+  "pytest-cov>=4.0.0",
+]
+dev = [
+  "ordinal-spatial[ml,tokenizer,viz,test]",
+]
+
+[project.scripts]
+os-benchmark = "ordinal_spatial.cli.benchmark:main"
+os-baseline = "ordinal_spatial.cli.baseline:main"
+os-validate = "ordinal_spatial.cli.validate:main"
+os-agent = "ordinal_spatial.agents.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.29,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  "gpu: marks tests requiring GPU",
+  "blender: marks tests requiring Blender",
+]
+
+[tool.ruff]
+line-length = 80
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
