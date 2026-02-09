@@ -50,6 +50,73 @@ if INSIDE_BLENDER:
       sys.exit(1)
 
 
+_gpu_logged = False
+
+def _setup_gpu():
+  """
+  初始化 GPU 渲染。
+  兼容 Blender 4.0+ / 5.0+，在 --background 模式下可靠工作。
+  每次 open_mainfile 后必须重新调用。
+  """
+  global _gpu_logged
+  verbose = not _gpu_logged
+
+  prefs = bpy.context.preferences
+  cycles_prefs = prefs.addons['cycles'].preferences
+
+  # 尝试各后端
+  activated = False
+  for compute_type in ['CUDA', 'OPTIX', 'HIP', 'ONEAPI']:
+    try:
+      cycles_prefs.compute_device_type = compute_type
+
+      # 必须传 compute_device_type 参数刷新设备列表
+      try:
+        cycles_prefs.get_devices(compute_type)
+      except TypeError:
+        cycles_prefs.get_devices()
+
+      # 检查是否有可用 GPU 设备
+      gpu_devices = [
+        d for d in cycles_prefs.devices if d.type != 'CPU'
+      ]
+      if not gpu_devices:
+        continue
+
+      # 启用所有 GPU，禁用 CPU
+      for device in cycles_prefs.devices:
+        device.use = (device.type != 'CPU')
+
+      activated = True
+      if verbose:
+        for d in gpu_devices:
+          print(f"  GPU device: {d.name} (type={d.type})")
+        print(f"  Backend: {compute_type}")
+      break
+
+    except Exception as e:
+      if verbose:
+        print(f"  {compute_type} failed: {e}")
+      continue
+
+  if not activated:
+    print("ERROR: No GPU device found, rendering on CPU!")
+    return
+
+  # 设置场景使用 GPU
+  bpy.context.scene.cycles.device = 'GPU'
+
+  # GPU 渲染优化
+  bpy.context.scene.cycles.tile_size = 512
+  bpy.context.scene.render.use_persistent_data = True
+
+  if verbose:
+    print(f"  Scene device: {bpy.context.scene.cycles.device}")
+    print(f"  Tile size: 512")
+    print(f"  Persistent data: True")
+    _gpu_logged = True
+
+
 @dataclass
 class CameraConfig:
   """单个相机视角的配置。"""
@@ -242,31 +309,7 @@ def render_multiview_scene(
 
   # GPU 加速
   if args.use_gpu == 1:
-    cycles_prefs = bpy.context.preferences.addons['cycles'].preferences
-    activated = False
-    for compute_type in ['CUDA', 'OPTIX', 'HIP', 'ONEAPI']:
-      try:
-        cycles_prefs.compute_device_type = compute_type
-        # 必须调用 get_devices() 刷新设备列表
-        cycles_prefs.get_devices()
-        gpu_found = False
-        for device in cycles_prefs.devices:
-          if device.type != 'CPU':
-            device.use = True
-            gpu_found = True
-            print(f"  GPU enabled: {device.name} ({compute_type})")
-          else:
-            device.use = False
-        if gpu_found:
-          activated = True
-          break
-      except Exception:
-        continue
-    if activated:
-      bpy.context.scene.cycles.device = 'GPU'
-      print(f"Rendering on GPU ({cycles_prefs.compute_device_type})")
-    else:
-      print("WARNING: No GPU found, falling back to CPU")
+    _setup_gpu()
 
   bpy.context.scene.cycles.samples = args.render_num_samples
   bpy.context.scene.cycles.blur_glossy = 2.0
