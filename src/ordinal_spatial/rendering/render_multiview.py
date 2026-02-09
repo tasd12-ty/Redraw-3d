@@ -54,43 +54,42 @@ _gpu_logged = False
 
 def _setup_gpu():
   """
-  初始化 GPU 渲染。
-  兼容 Blender 4.0+ / 5.0+，在 --background 模式下可靠工作。
-  每次 open_mainfile 后必须重新调用。
+  初始化 GPU 渲染 (Blender 5.0+)。
+  每次 open_mainfile 后必须重新调用（scene 状态会被重置）。
   """
   global _gpu_logged
   verbose = not _gpu_logged
 
-  prefs = bpy.context.preferences
-  cycles_prefs = prefs.addons['cycles'].preferences
+  scene = bpy.context.scene
+  scene.render.engine = "CYCLES"
 
-  # 尝试各后端
+  prefs = bpy.context.preferences.addons['cycles'].preferences
+
+  # 尝试各后端: CUDA 优先（L20 等数据中心卡更稳定）
   activated = False
   for compute_type in ['CUDA', 'OPTIX', 'HIP', 'ONEAPI']:
     try:
-      cycles_prefs.compute_device_type = compute_type
+      prefs.compute_device_type = compute_type
 
-      # 必须传 compute_device_type 参数刷新设备列表
-      try:
-        cycles_prefs.get_devices(compute_type)
-      except TypeError:
-        cycles_prefs.get_devices()
+      # 刷新设备列表 (5.0+ 兼容: 无参数调用)
+      refresh = getattr(prefs, 'refresh_devices', prefs.get_devices)
+      refresh()
 
       # 检查是否有可用 GPU 设备
       gpu_devices = [
-        d for d in cycles_prefs.devices if d.type != 'CPU'
+        d for d in prefs.devices if d.type != 'CPU'
       ]
       if not gpu_devices:
         continue
 
       # 启用所有 GPU，禁用 CPU
-      for device in cycles_prefs.devices:
+      for device in prefs.devices:
         device.use = (device.type != 'CPU')
 
       activated = True
       if verbose:
         for d in gpu_devices:
-          print(f"  GPU device: {d.name} (type={d.type})")
+          print(f"  GPU: {d.name} [{d.type}]")
         print(f"  Backend: {compute_type}")
       break
 
@@ -104,16 +103,11 @@ def _setup_gpu():
     return
 
   # 设置场景使用 GPU
-  bpy.context.scene.cycles.device = 'GPU'
-
-  # GPU 渲染优化
-  bpy.context.scene.cycles.tile_size = 512
-  bpy.context.scene.render.use_persistent_data = True
+  scene.cycles.device = 'GPU'
+  scene.render.use_persistent_data = True
 
   if verbose:
-    print(f"  Scene device: {bpy.context.scene.cycles.device}")
-    print(f"  Tile size: 512")
-    print(f"  Persistent data: True")
+    print(f"  cycles.device = {scene.cycles.device}")
     _gpu_logged = True
 
 
