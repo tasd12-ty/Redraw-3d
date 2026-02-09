@@ -243,15 +243,30 @@ def render_multiview_scene(
   # GPU 加速
   if args.use_gpu == 1:
     cycles_prefs = bpy.context.preferences.addons['cycles'].preferences
-    for compute_type in ['CUDA', 'OPTIX', 'HIP', 'ONEAPI']:
+    activated = False
+    for compute_type in ['OPTIX', 'CUDA', 'HIP', 'ONEAPI']:
       try:
         cycles_prefs.compute_device_type = compute_type
+        # 必须调用 get_devices() 刷新设备列表
+        cycles_prefs.get_devices()
+        gpu_found = False
         for device in cycles_prefs.devices:
-          device.use = True
-        break
+          if device.type != 'CPU':
+            device.use = True
+            gpu_found = True
+            print(f"  GPU enabled: {device.name} ({compute_type})")
+          else:
+            device.use = False
+        if gpu_found:
+          activated = True
+          break
       except Exception:
         continue
-    bpy.context.scene.cycles.device = 'GPU'
+    if activated:
+      bpy.context.scene.cycles.device = 'GPU'
+      print(f"Rendering on GPU ({cycles_prefs.compute_device_type})")
+    else:
+      print("WARNING: No GPU found, falling back to CPU")
 
   bpy.context.scene.cycles.samples = args.render_num_samples
   bpy.context.scene.cycles.blur_glossy = 2.0
