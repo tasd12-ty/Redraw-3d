@@ -481,6 +481,32 @@ def add_random_objects(
   return objects, blender_objects
 
 
+def _build_object_count_schedule(
+    num_images, min_objects, max_objects, balanced=True
+):
+  """
+  预生成每个场景的物体数量列表。
+  balanced=True 时严格均分，每个数量级别的场景数最多相差 1。
+  """
+  n_levels = max_objects - min_objects + 1
+  if not balanced or n_levels <= 0:
+    return [
+      random.randint(min_objects, max_objects)
+      for _ in range(num_images)
+    ]
+
+  per_level = num_images // n_levels
+  remainder = num_images % n_levels
+  schedule = []
+  for k in range(n_levels):
+    obj_count = min_objects + k
+    # 余数优先分配给较小的物体数量
+    n = per_level + (1 if k < remainder else 0)
+    schedule.extend([obj_count] * n)
+  random.shuffle(schedule)
+  return schedule
+
+
 def main(args):
   """多视角渲染主入口。"""
   # 设置随机种子，确保可复现
@@ -506,6 +532,19 @@ def main(args):
   os.makedirs(single_view_dir, exist_ok=True)
   args.output_single_view_dir = single_view_dir
 
+  # 预生成物体数量分配表
+  balanced = getattr(args, 'balanced_objects', True)
+  object_schedule = _build_object_count_schedule(
+    args.num_images, args.min_objects, args.max_objects,
+    balanced=balanced
+  )
+  if balanced:
+    from collections import Counter
+    dist = Counter(object_schedule)
+    print(f"Object count distribution (balanced={balanced}):")
+    for k in sorted(dist):
+      print(f"  {k} objects: {dist[k]} scenes")
+
   all_scenes = []
   successful = 0
   failed = 0
@@ -513,7 +552,7 @@ def main(args):
   for i in range(args.num_images):
     scene_id = f"{args.split}_{(i + args.start_idx):06d}"
     scene_output_dir = os.path.join(multiview_dir, scene_id)
-    num_objects = random.randint(args.min_objects, args.max_objects)
+    num_objects = object_schedule[i]
 
     try:
       scene_struct = render_multiview_scene(
@@ -570,11 +609,13 @@ parser.add_argument('--shape_dir', default='data/shapes_v5')
 parser.add_argument('--material_dir', default='data/materials_v5')
 
 # 对象设置
-parser.add_argument('--min_objects', default=4, type=int)
+parser.add_argument('--min_objects', default=3, type=int)
 parser.add_argument('--max_objects', default=10, type=int)
 parser.add_argument('--min_dist', default=0.25, type=float)
 parser.add_argument('--margin', default=0.4, type=float)
 parser.add_argument('--max_retries', default=50, type=int)
+parser.add_argument('--balanced_objects', default=1, type=int,
+  help="1=balanced object counts across scenes, 0=random")
 
 # 多视角设置
 parser.add_argument('--n_views', default=4, type=int,

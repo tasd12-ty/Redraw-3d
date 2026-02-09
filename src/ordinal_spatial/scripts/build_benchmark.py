@@ -2,23 +2,13 @@
 """
 Build ORDINAL-SPATIAL benchmark dataset.
 
-This script orchestrates the complete benchmark generation pipeline:
-1. Generate scene configurations
-2. Render images (single-view and multi-view)
-3. Extract ground truth constraints
-4. Create dataset splits
+生成指定数量的场景，物体数量在 min-max 范围内严格均分。
+无 train/val/test 划分，生成扁平数据集。
 
 Usage:
-    python -m ordinal_spatial.scripts.build_benchmark \
-        --output-dir ./data/benchmark \
-        --blender-path /path/to/blender \
-        --n-train 1000 --n-val 200 --n-test 200
-
-For small test run:
-    python -m ordinal_spatial.scripts.build_benchmark \
-        --output-dir ./data/benchmark_test \
-        --blender-path /path/to/blender \
-        --small
+    uv run os-benchmark -o ./data/bench -b /path/to/blender -n 1000
+    uv run os-benchmark -o ./data/bench -b /path/to/blender -n 1000 \
+        --min-objects 3 --max-objects 10 --use-gpu
 """
 
 import argparse
@@ -28,10 +18,10 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,494 +31,382 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class SplitConfig:
-    """Configuration for a dataset split."""
-    name: str
-    n_scenes: int
-    min_objects: int
-    max_objects: int
-    tau: float
-    description: str
-
-
-@dataclass
 class BenchmarkConfig:
-    """Complete benchmark configuration."""
-    output_dir: str
-    blender_path: str
-    n_views: int = 4
-    image_width: int = 480
-    image_height: int = 320
-    camera_distance: float = 12.0
-    elevation: float = 30.0
-    use_gpu: bool = False
-    render_samples: int = 256
-    random_seed: int = 42
-
-    # Split configurations
-    splits: List[SplitConfig] = None
-
-    def __post_init__(self):
-        if self.splits is None:
-            self.splits = [
-                SplitConfig("train", 1000, 4, 10, 0.10,
-                           "Training set with standard configuration"),
-                SplitConfig("val", 200, 4, 10, 0.10,
-                           "Validation set, same distribution as train"),
-                SplitConfig("test_iid", 200, 4, 10, 0.10,
-                           "IID test set, same distribution as train"),
-                SplitConfig("test_comp", 100, 10, 15, 0.10,
-                           "Compositional test: more objects"),
-                SplitConfig("test_hard", 100, 4, 10, 0.05,
-                           "Hard test: stricter tolerance (tau=0.05)"),
-            ]
+  """数据集生成配置。"""
+  output_dir: str
+  blender_path: str
+  n_scenes: int = 1000
+  min_objects: int = 3
+  max_objects: int = 10
+  tau: float = 0.10
+  n_views: int = 4
+  image_width: int = 480
+  image_height: int = 320
+  camera_distance: float = 12.0
+  elevation: float = 30.0
+  use_gpu: bool = False
+  render_samples: int = 256
+  random_seed: int = 42
 
 
 class BenchmarkBuilder:
-    """
-    Orchestrates benchmark dataset generation.
-    """
+  """数据集生成器。"""
 
-    def __init__(self, config: BenchmarkConfig):
-        """
-        Initialize benchmark builder.
+  def __init__(self, config: BenchmarkConfig):
+    self.config = config
+    self.output_dir = Path(config.output_dir)
+    self.rendering_dir = Path(__file__).parent.parent / "rendering"
 
-        Args:
-            config: Benchmark configuration
-        """
-        self.config = config
-        self.output_dir = Path(config.output_dir)
-        # 渲染模块路径 (相对于包根目录)
-        self.rendering_dir = Path(__file__).parent.parent / "rendering"
+  def build(self) -> Dict[str, Any]:
+    """生成完整数据集。"""
+    logger.info("=" * 60)
+    logger.info("ORDINAL-SPATIAL Dataset Builder")
+    logger.info(f"  Scenes: {self.config.n_scenes}")
+    logger.info(
+      f"  Objects: {self.config.min_objects}-{self.config.max_objects}"
+    )
+    logger.info(f"  Tau: {self.config.tau}")
+    logger.info(
+      f"  Resolution: {self.config.image_width}x{self.config.image_height}"
+    )
+    logger.info("=" * 60)
 
-    def build(self) -> Dict[str, Any]:
-        """
-        Build the complete benchmark dataset.
+    # 创建目录结构
+    self._create_directories()
 
-        Returns:
-            Dataset statistics
-        """
-        logger.info("=" * 60)
-        logger.info("ORDINAL-SPATIAL Benchmark Builder")
-        logger.info("=" * 60)
+    # 渲染
+    logger.info(
+      f"Step 1: Rendering {self.config.n_scenes} scenes..."
+    )
+    render_output = self._render()
 
-        # Create directory structure
-        self._create_directories()
+    # 提取约束
+    logger.info("Step 2: Extracting ground truth constraints...")
+    constraints_data = self._extract_constraints(render_output)
 
-        # Build each split
-        all_stats = {}
-        for split_config in self.config.splits:
-            logger.info(f"\n{'='*40}")
-            logger.info(f"Building split: {split_config.name}")
-            logger.info(f"  Scenes: {split_config.n_scenes}")
-            logger.info(f"  Objects: {split_config.min_objects}-{split_config.max_objects}")
-            logger.info(f"  Tau: {split_config.tau}")
-            logger.info(f"{'='*40}")
+    # 整理数据集
+    logger.info("Step 3: Building dataset...")
+    dataset = self._build_dataset(render_output, constraints_data)
 
-            stats = self._build_split(split_config)
-            all_stats[split_config.name] = stats
+    # 保存数据集索引
+    index_file = self.output_dir / "dataset.json"
+    with open(index_file, 'w') as f:
+      json.dump(dataset, f, indent=2)
 
-        # Generate dataset info
-        self._save_dataset_info(all_stats)
+    # 保存数据集信息
+    self._save_dataset_info(len(dataset))
 
-        logger.info("\n" + "=" * 60)
-        logger.info("Benchmark generation complete!")
-        logger.info(f"Output directory: {self.output_dir}")
-        logger.info("=" * 60)
+    # 清理临时文件
+    render_temp = self.output_dir / "render_temp"
+    if render_temp.exists():
+      shutil.rmtree(render_temp)
 
-        return all_stats
+    logger.info("\n" + "=" * 60)
+    logger.info("Dataset generation complete!")
+    logger.info(f"  Output: {self.output_dir}")
+    logger.info(f"  Scenes: {len(dataset)}")
+    logger.info("=" * 60)
 
-    def _create_directories(self):
-        """Create output directory structure."""
-        dirs = [
-            self.output_dir,
-            self.output_dir / "images" / "single_view",
-            self.output_dir / "images" / "multi_view",
-            self.output_dir / "splits",
-            self.output_dir / "metadata",
-        ]
-        for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"Created directory: {d}")
+    return {"n_scenes": len(dataset)}
 
-    def _build_split(self, split_config: SplitConfig) -> Dict[str, Any]:
-        """
-        Build a single dataset split.
+  def _create_directories(self):
+    """创建目录结构。"""
+    for d in [
+      self.output_dir,
+      self.output_dir / "images" / "single_view",
+      self.output_dir / "images" / "multi_view",
+      self.output_dir / "metadata",
+    ]:
+      d.mkdir(parents=True, exist_ok=True)
 
-        Args:
-            split_config: Split configuration
+  def _render(self) -> Path:
+    """调用 Blender 渲染所有场景。"""
+    render_output = self.output_dir / "render_temp"
+    render_output.mkdir(parents=True, exist_ok=True)
 
-        Returns:
-            Split statistics
-        """
-        # Step 1: Render images
-        logger.info(f"Step 1: Rendering {split_config.n_scenes} scenes...")
-        render_output = self._render_split(split_config)
+    render_script = str(self.rendering_dir / "render_multiview.py")
+    data_dir = self.rendering_dir / "data"
 
-        # Step 2: Extract constraints
-        logger.info("Step 2: Extracting ground truth constraints...")
-        constraints_data = self._extract_constraints(render_output, split_config)
+    cmd = [
+      self.config.blender_path,
+      "--background",
+      "--python", render_script,
+      "--",
+      "--base_scene_blendfile",
+      str(data_dir / "base_scene_v5.blend"),
+      "--properties_json",
+      str(data_dir / "properties.json"),
+      "--shape_dir", str(data_dir / "shapes_v5"),
+      "--material_dir", str(data_dir / "materials_v5"),
+      "--output_dir", str(render_output),
+      "--split", "scene",
+      "--num_images", str(self.config.n_scenes),
+      "--min_objects", str(self.config.min_objects),
+      "--max_objects", str(self.config.max_objects),
+      "--n_views", str(self.config.n_views),
+      "--camera_distance", str(self.config.camera_distance),
+      "--elevation", str(self.config.elevation),
+      "--width", str(self.config.image_width),
+      "--height", str(self.config.image_height),
+      "--render_num_samples", str(self.config.render_samples),
+      "--balanced_objects", "1",
+      "--seed", str(self.config.random_seed),
+    ]
 
-        # Step 3: Build split file
-        logger.info("Step 3: Building split file...")
-        split_data = self._build_split_file(
-            render_output, constraints_data, split_config
+    if self.config.use_gpu:
+      cmd.extend(["--use_gpu", "1"])
+
+    logger.info(f"Running Blender render...")
+
+    try:
+      result = subprocess.run(cmd, timeout=3600 * 8)
+      if result.returncode != 0:
+        raise RuntimeError("Blender render failed")
+      logger.info("Render completed successfully")
+    except subprocess.TimeoutExpired:
+      logger.error("Render timed out")
+      raise
+
+    return render_output
+
+  def _extract_constraints(
+    self, render_output: Path
+  ) -> Dict[str, Dict]:
+    """从渲染结果中提取约束。"""
+    try:
+      from ordinal_spatial.agents import BlenderConstraintAgent
+    except ImportError:
+      logger.warning(
+        "BlenderConstraintAgent not available, "
+        "using scene data directly"
+      )
+      return {}
+
+    scenes_file = render_output / "scene_scenes.json"
+    if not scenes_file.exists():
+      logger.warning(f"Scenes file not found: {scenes_file}")
+      return {}
+
+    with open(scenes_file) as f:
+      scenes_data = json.load(f)
+
+    constraints_data = {}
+    agent = BlenderConstraintAgent()
+
+    for scene in scenes_data.get("scenes", []):
+      scene_id = scene.get("scene_id", "")
+      try:
+        constraint_set = agent.extract_from_single_view(
+          image=scene, tau=self.config.tau
+        )
+        constraints_data[scene_id] = constraint_set.to_dict()
+      except Exception as e:
+        logger.warning(
+          f"Failed to extract constraints for {scene_id}: {e}"
+        )
+        constraints_data[scene_id] = scene.get(
+          "world_constraints", {}
         )
 
-        # Save split file
-        split_file = self.output_dir / "splits" / f"{split_config.name}.json"
-        with open(split_file, 'w') as f:
-            json.dump(split_data, f, indent=2)
-        logger.info(f"Saved split file: {split_file}")
+    return constraints_data
 
-        return {
-            "n_scenes": len(split_data),
-            "n_single_view_images": len(split_data),
-            "n_multi_view_images": len(split_data) * self.config.n_views,
-        }
+  def _build_dataset(
+    self,
+    render_output: Path,
+    constraints_data: Dict[str, Dict]
+  ) -> List[Dict]:
+    """整理渲染结果到最终目录。"""
+    dataset = []
 
-    def _render_split(self, split_config: SplitConfig) -> Path:
-        """
-        Render images for a split using Blender.
+    scenes_file = render_output / "scene_scenes.json"
+    if not scenes_file.exists():
+      logger.error(f"Scenes file not found: {scenes_file}")
+      return dataset
 
-        Args:
-            split_config: Split configuration
+    with open(scenes_file) as f:
+      scenes_data = json.load(f)
 
-        Returns:
-            Path to render output directory
-        """
-        # 使用本地路径
-        render_output = self.output_dir / "render_temp" / split_config.name
-        blender_output = str(render_output)
+    for scene in scenes_data.get("scenes", []):
+      scene_id = scene.get("scene_id", "")
 
-        render_output.mkdir(parents=True, exist_ok=True)
+      # 复制多视角图片
+      src_mv = render_output / "multi_view" / scene_id
+      dst_mv = (
+        self.output_dir / "images" / "multi_view" / scene_id
+      )
+      if src_mv.exists():
+        if dst_mv.exists():
+          shutil.rmtree(dst_mv)
+        shutil.copytree(src_mv, dst_mv)
 
-        # 构建 Blender 命令
-        render_script = str(self.rendering_dir / "render_multiview.py")
-        data_dir = self.rendering_dir / "data"
-        cmd = [
-            self.config.blender_path,
-            "--background",
-            "--python", render_script,
-            "--",
-            "--base_scene_blendfile", str(data_dir / "base_scene_v5.blend"),
-            "--properties_json", str(data_dir / "properties.json"),
-            "--shape_dir", str(data_dir / "shapes_v5"),
-            "--material_dir", str(data_dir / "materials_v5"),
-            "--output_dir", blender_output,
-            "--split", split_config.name,
-            "--num_images", str(split_config.n_scenes),
-            "--min_objects", str(split_config.min_objects),
-            "--max_objects", str(split_config.max_objects),
-            "--n_views", str(self.config.n_views),
-            "--camera_distance", str(self.config.camera_distance),
-            "--elevation", str(self.config.elevation),
-            "--width", str(self.config.image_width),
-            "--height", str(self.config.image_height),
-            "--render_num_samples", str(self.config.render_samples),
-        ]
+      # 复制单视角图片
+      src_sv = render_output / "single_view" / f"{scene_id}.png"
+      dst_sv = (
+        self.output_dir / "images" / "single_view"
+        / f"{scene_id}.png"
+      )
+      if src_sv.exists():
+        shutil.copy(src_sv, dst_sv)
 
-        if self.config.use_gpu:
-            cmd.extend(["--use_gpu", "1"])
+      # 保存元数据
+      metadata_file = (
+        self.output_dir / "metadata" / f"{scene_id}.json"
+      )
+      scene_metadata = {
+        **scene,
+        "constraints": constraints_data.get(scene_id, {})
+      }
+      with open(metadata_file, 'w') as f:
+        json.dump(scene_metadata, f, indent=2)
 
-        logger.info(f"Running Blender render to {blender_output}...")
+      # 数据集条目
+      multi_view_images = [
+        f"images/multi_view/{scene_id}/view_{i}.png"
+        for i in range(self.config.n_views)
+      ]
 
-        try:
-            result = subprocess.run(
-                cmd,
-                timeout=3600 * 4
-            )
+      dataset.append({
+        "scene_id": scene_id,
+        "single_view_image":
+          f"images/single_view/{scene_id}.png",
+        "multi_view_images": multi_view_images,
+        "metadata_path": f"metadata/{scene_id}.json",
+        "n_objects": scene.get(
+          "n_objects", len(scene.get("objects", []))
+        ),
+        "tau": self.config.tau,
+      })
 
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Render failed for split {split_config.name}"
-                )
+    return dataset
 
-            logger.info("Render completed successfully")
+  def _save_dataset_info(self, n_scenes: int):
+    """保存数据集信息。"""
+    info = {
+      "name": "ORDINAL-SPATIAL Dataset",
+      "version": "1.0",
+      "created": datetime.now().isoformat(),
+      "config": {
+        "n_scenes": self.config.n_scenes,
+        "min_objects": self.config.min_objects,
+        "max_objects": self.config.max_objects,
+        "tau": self.config.tau,
+        "n_views": self.config.n_views,
+        "image_size": [
+          self.config.image_width, self.config.image_height
+        ],
+        "camera_distance": self.config.camera_distance,
+        "elevation": self.config.elevation,
+        "render_samples": self.config.render_samples,
+        "seed": self.config.random_seed,
+      },
+      "statistics": {
+        "total_scenes": n_scenes,
+        "total_single_view_images": n_scenes,
+        "total_multi_view_images":
+          n_scenes * self.config.n_views,
+      },
+    }
 
-        except subprocess.TimeoutExpired:
-            logger.error("Render timed out")
-            raise
-
-        return render_output
-
-    def _extract_constraints(
-        self,
-        render_output: Path,
-        split_config: SplitConfig
-    ) -> Dict[str, Dict]:
-        """
-        Extract ground truth constraints from rendered scenes.
-
-        Args:
-            render_output: Path to render output
-            split_config: Split configuration
-
-        Returns:
-            Dictionary mapping scene_id to constraints
-        """
-        # Import constraint extraction
-        try:
-            from ordinal_spatial.agents import BlenderConstraintAgent
-        except ImportError:
-            logger.warning("BlenderConstraintAgent not available, using scene data directly")
-            return {}
-
-        # Load scene data
-        scenes_file = render_output / f"{split_config.name}_scenes.json"
-        if not scenes_file.exists():
-            logger.warning(f"Scenes file not found: {scenes_file}")
-            return {}
-
-        with open(scenes_file) as f:
-            scenes_data = json.load(f)
-
-        constraints_data = {}
-        agent = BlenderConstraintAgent()
-
-        for scene in scenes_data.get("scenes", []):
-            scene_id = scene.get("scene_id", "")
-            try:
-                # Extract constraints using agent
-                # extract_from_single_view accepts dict input
-                constraint_set = agent.extract_from_single_view(
-                    image=scene,  # Pass scene dict directly
-                    tau=split_config.tau
-                )
-                constraints_data[scene_id] = constraint_set.to_dict()
-            except Exception as e:
-                logger.warning(f"Failed to extract constraints for {scene_id}: {e}")
-                # Use basic constraints from scene
-                constraints_data[scene_id] = scene.get("world_constraints", {})
-
-        return constraints_data
-
-    def _build_split_file(
-        self,
-        render_output: Path,
-        constraints_data: Dict[str, Dict],
-        split_config: SplitConfig
-    ) -> List[Dict]:
-        """
-        Build the split JSON file.
-
-        Args:
-            render_output: Path to render output
-            constraints_data: Extracted constraints
-            split_config: Split configuration
-
-        Returns:
-            List of scene entries for split file
-        """
-        split_data = []
-
-        # Load scene data
-        scenes_file = render_output / f"{split_config.name}_scenes.json"
-        if not scenes_file.exists():
-            logger.error(f"Scenes file not found: {scenes_file}")
-            return split_data
-
-        with open(scenes_file) as f:
-            scenes_data = json.load(f)
-
-        # Process each scene
-        for scene in scenes_data.get("scenes", []):
-            scene_id = scene.get("scene_id", "")
-
-            # Copy images to final location
-            src_multiview = render_output / "multi_view" / scene_id
-            dst_multiview = self.output_dir / "images" / "multi_view" / scene_id
-
-            if src_multiview.exists():
-                if dst_multiview.exists():
-                    shutil.rmtree(dst_multiview)
-                shutil.copytree(src_multiview, dst_multiview)
-
-            # Copy single view
-            src_single = render_output / "single_view" / f"{scene_id}.png"
-            dst_single = self.output_dir / "images" / "single_view" / f"{scene_id}.png"
-
-            if src_single.exists():
-                shutil.copy(src_single, dst_single)
-
-            # Save metadata
-            metadata_file = self.output_dir / "metadata" / f"{scene_id}.json"
-            scene_metadata = {
-                **scene,
-                "constraints": constraints_data.get(scene_id, {})
-            }
-            with open(metadata_file, 'w') as f:
-                json.dump(scene_metadata, f, indent=2)
-
-            # Build split entry
-            multi_view_images = [
-                f"images/multi_view/{scene_id}/view_{i}.png"
-                for i in range(self.config.n_views)
-            ]
-
-            entry = {
-                "scene_id": scene_id,
-                "single_view_image": f"images/single_view/{scene_id}.png",
-                "multi_view_images": multi_view_images,
-                "metadata_path": f"metadata/{scene_id}.json",
-                "n_objects": scene.get("n_objects", len(scene.get("objects", []))),
-                "tau": split_config.tau,
-                "split": split_config.name
-            }
-
-            split_data.append(entry)
-
-        # Cleanup temp render output
-        try:
-            shutil.rmtree(render_output)
-        except Exception as e:
-            logger.warning(f"Failed to cleanup temp directory: {e}")
-
-        return split_data
-
-    def _save_dataset_info(self, stats: Dict[str, Any]):
-        """Save dataset information file."""
-        info = {
-            "name": "ORDINAL-SPATIAL Benchmark",
-            "version": "1.0",
-            "created": datetime.now().isoformat(),
-            "config": {
-                "n_views": self.config.n_views,
-                "image_size": [self.config.image_width, self.config.image_height],
-                "camera_distance": self.config.camera_distance,
-                "elevation": self.config.elevation,
-            },
-            "splits": {
-                split.name: {
-                    "n_scenes": split.n_scenes,
-                    "min_objects": split.min_objects,
-                    "max_objects": split.max_objects,
-                    "tau": split.tau,
-                    "description": split.description,
-                }
-                for split in self.config.splits
-            },
-            "statistics": stats,
-            "total_scenes": sum(s.get("n_scenes", 0) for s in stats.values()),
-            "total_images": sum(
-                s.get("n_single_view_images", 0) + s.get("n_multi_view_images", 0)
-                for s in stats.values()
-            ),
-        }
-
-        info_file = self.output_dir / "dataset_info.json"
-        with open(info_file, 'w') as f:
-            json.dump(info, f, indent=2)
-
-        logger.info(f"Saved dataset info: {info_file}")
+    info_file = self.output_dir / "dataset_info.json"
+    with open(info_file, 'w') as f:
+      json.dump(info, f, indent=2)
+    logger.info(f"Saved dataset info: {info_file}")
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Build ORDINAL-SPATIAL benchmark dataset"
-    )
+  """Main entry point."""
+  parser = argparse.ArgumentParser(
+    description="Build ORDINAL-SPATIAL dataset"
+  )
 
-    parser.add_argument(
-        "--output-dir", "-o",
-        required=True,
-        help="Output directory for benchmark"
-    )
-    parser.add_argument(
-        "--blender-path", "-b",
-        default="blender",
-        help="Path to Blender executable"
-    )
+  parser.add_argument(
+    "--output-dir", "-o", required=True,
+    help="Output directory"
+  )
+  parser.add_argument(
+    "--blender-path", "-b", default="blender",
+    help="Path to Blender executable"
+  )
 
-    # Dataset size
-    parser.add_argument("--n-train", type=int, default=1000)
-    parser.add_argument("--n-val", type=int, default=200)
-    parser.add_argument("--n-test", type=int, default=200)
-    parser.add_argument("--n-test-comp", type=int, default=100)
-    parser.add_argument("--n-test-hard", type=int, default=100)
+  # 数据集规模
+  parser.add_argument(
+    "--n-scenes", "-n", type=int, default=1000,
+    help="Total number of scenes to generate"
+  )
 
-    # Rendering settings
-    parser.add_argument("--n-views", type=int, default=4)
-    parser.add_argument("--width", type=int, default=480)
-    parser.add_argument("--height", type=int, default=320)
-    parser.add_argument("--use-gpu", action="store_true")
-    parser.add_argument("--render-samples", type=int, default=256)
+  # 物体数量范围
+  parser.add_argument(
+    "--min-objects", type=int, default=3,
+    help="Minimum objects per scene (default: 3)"
+  )
+  parser.add_argument(
+    "--max-objects", type=int, default=10,
+    help="Maximum objects per scene (default: 10)"
+  )
 
-    # Camera settings
-    parser.add_argument("--camera-distance", type=float, default=12.0)
-    parser.add_argument("--elevation", type=float, default=30.0)
+  # 约束参数
+  parser.add_argument(
+    "--tau", type=float, default=0.10,
+    help="Tolerance threshold (default: 0.10)"
+  )
 
-    # Presets
-    parser.add_argument(
-        "--small", action="store_true",
-        help="Generate small test dataset"
-    )
-    parser.add_argument(
-        "--tiny", action="store_true",
-        help="Generate tiny dataset for debugging"
-    )
+  # 渲染设置
+  parser.add_argument("--n-views", type=int, default=4)
+  parser.add_argument("--width", type=int, default=480)
+  parser.add_argument("--height", type=int, default=320)
+  parser.add_argument("--use-gpu", action="store_true")
+  parser.add_argument(
+    "--render-samples", type=int, default=256
+  )
 
-    parser.add_argument("--seed", type=int, default=42)
+  # 相机设置
+  parser.add_argument(
+    "--camera-distance", type=float, default=12.0
+  )
+  parser.add_argument(
+    "--elevation", type=float, default=30.0
+  )
 
-    args = parser.parse_args()
+  parser.add_argument("--seed", type=int, default=42)
 
-    # Apply presets
-    if args.tiny:
-        args.n_train = 5
-        args.n_val = 2
-        args.n_test = 2
-        args.n_test_comp = 2
-        args.n_test_hard = 2
-        args.render_samples = 64
-    elif args.small:
-        args.n_train = 100
-        args.n_val = 20
-        args.n_test = 20
-        args.n_test_comp = 10
-        args.n_test_hard = 10
-        args.render_samples = 128
+  args = parser.parse_args()
 
-    # Build config
-    splits = [
-        SplitConfig("train", args.n_train, 4, 10, 0.10,
-                   "Training set"),
-        SplitConfig("val", args.n_val, 4, 10, 0.10,
-                   "Validation set"),
-        SplitConfig("test_iid", args.n_test, 4, 10, 0.10,
-                   "IID test set"),
-        SplitConfig("test_comp", args.n_test_comp, 10, 15, 0.10,
-                   "Compositional test (more objects)"),
-        SplitConfig("test_hard", args.n_test_hard, 4, 10, 0.05,
-                   "Hard test (stricter tau)"),
-    ]
+  # 打印配置
+  n_levels = args.max_objects - args.min_objects + 1
+  per_level = args.n_scenes // n_levels
+  remainder = args.n_scenes % n_levels
+  print(f"Dataset configuration:")
+  print(f"  Total scenes: {args.n_scenes}")
+  print(f"  Objects range: {args.min_objects}-{args.max_objects} "
+        f"({n_levels} levels)")
+  print(f"  Per level: {per_level}"
+        f" (+1 for first {remainder})" if remainder else "")
+  print(f"  Resolution: {args.width}x{args.height}")
+  print(f"  Render samples: {args.render_samples}")
+  print(f"  Tau: {args.tau}")
 
-    config = BenchmarkConfig(
-        output_dir=args.output_dir,
-        blender_path=args.blender_path,
-        n_views=args.n_views,
-        image_width=args.width,
-        image_height=args.height,
-        camera_distance=args.camera_distance,
-        elevation=args.elevation,
-        use_gpu=args.use_gpu,
-        render_samples=args.render_samples,
-        random_seed=args.seed,
-        splits=splits
-    )
+  config = BenchmarkConfig(
+    output_dir=args.output_dir,
+    blender_path=args.blender_path,
+    n_scenes=args.n_scenes,
+    min_objects=args.min_objects,
+    max_objects=args.max_objects,
+    tau=args.tau,
+    n_views=args.n_views,
+    image_width=args.width,
+    image_height=args.height,
+    camera_distance=args.camera_distance,
+    elevation=args.elevation,
+    use_gpu=args.use_gpu,
+    render_samples=args.render_samples,
+    random_seed=args.seed,
+  )
 
-    # Build benchmark
-    builder = BenchmarkBuilder(config)
-    stats = builder.build()
+  builder = BenchmarkBuilder(config)
+  stats = builder.build()
 
-    # Print summary
-    print("\n" + "=" * 50)
-    print("BENCHMARK GENERATION SUMMARY")
-    print("=" * 50)
-    for split_name, split_stats in stats.items():
-        print(f"\n{split_name}:")
-        for key, value in split_stats.items():
-            print(f"  {key}: {value}")
+  print(f"\nDone: {stats['n_scenes']} scenes generated")
 
 
 if __name__ == "__main__":
-    main()
+  main()

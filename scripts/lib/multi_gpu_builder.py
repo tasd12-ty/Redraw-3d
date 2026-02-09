@@ -89,11 +89,11 @@ class MultiGPUBuilder:
         # 构建分割配置
         sizes = dataset_size.value
         self.splits = [
-            SplitConfig("train", sizes["train"], 4, 10, 0.10),
-            SplitConfig("val", sizes["val"], 4, 10, 0.10),
-            SplitConfig("test_iid", sizes["test_iid"], 4, 10, 0.10),
+            SplitConfig("train", sizes["train"], 3, 10, 0.10),
+            SplitConfig("val", sizes["val"], 3, 10, 0.10),
+            SplitConfig("test_iid", sizes["test_iid"], 3, 10, 0.10),
             SplitConfig("test_comp", sizes["test_comp"], 10, 15, 0.10),
-            SplitConfig("test_hard", sizes["test_hard"], 4, 10, 0.05),
+            SplitConfig("test_hard", sizes["test_hard"], 3, 10, 0.05),
         ]
 
         self._create_directories()
