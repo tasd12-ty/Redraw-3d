@@ -244,7 +244,7 @@ def render_multiview_scene(
   if args.use_gpu == 1:
     cycles_prefs = bpy.context.preferences.addons['cycles'].preferences
     activated = False
-    for compute_type in ['OPTIX', 'CUDA', 'HIP', 'ONEAPI']:
+    for compute_type in ['CUDA', 'OPTIX', 'HIP', 'ONEAPI']:
       try:
         cycles_prefs.compute_device_type = compute_type
         # 必须调用 get_devices() 刷新设备列表
