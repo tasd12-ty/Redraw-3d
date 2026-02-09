@@ -236,14 +236,13 @@ class BenchmarkBuilder:
         try:
             result = subprocess.run(
                 cmd,
-                capture_output=True,
-                text=True,
                 timeout=3600 * 4
             )
 
             if result.returncode != 0:
-                logger.error(f"Blender render failed: {result.stderr}")
-                raise RuntimeError(f"Render failed for split {split_config.name}")
+                raise RuntimeError(
+                    f"Render failed for split {split_config.name}"
+                )
 
             logger.info("Render completed successfully")
 
