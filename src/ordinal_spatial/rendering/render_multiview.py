@@ -315,7 +315,6 @@ def render_multiview_scene(
   scene_id = f"{output_split}_{output_index:06d}"
   scene_struct = {
     "scene_id": scene_id,
-    "split": output_split,
     "image_index": output_index,
     "n_objects": num_objects,
     "objects": [],
@@ -602,7 +601,7 @@ def main(args):
   failed = 0
 
   for i in range(args.num_images):
-    scene_id = f"{args.split}_{(i + args.start_idx):06d}"
+    scene_id = f"{args.prefix}_{(i + args.start_idx):06d}"
     scene_output_dir = os.path.join(multiview_dir, scene_id)
     num_objects = object_schedule[i]
 
@@ -611,7 +610,7 @@ def main(args):
         args,
         num_objects=num_objects,
         output_index=(i + args.start_idx),
-        output_split=args.split,
+        output_split=args.prefix,
         output_dir=scene_output_dir,
         mv_config=mv_config
       )
@@ -630,12 +629,12 @@ def main(args):
 
   # 保存合并的场景文件
   output_file = os.path.join(
-    args.output_dir, f"{args.split}_scenes.json"
+    args.output_dir, f"{args.prefix}_scenes.json"
   )
   output_data = {
     "info": {
       "date": dt.today().strftime("%Y-%m-%d"),
-      "split": args.split,
+      "prefix": args.prefix,
       "n_views": args.n_views,
       "camera_config": asdict(mv_config)
     },
@@ -683,7 +682,7 @@ parser.add_argument('--azimuth_start', default=45.0, type=float,
 parser.add_argument('--output_dir', default='../output/multiview/')
 parser.add_argument('--start_idx', default=0, type=int)
 parser.add_argument('--num_images', default=5, type=int)
-parser.add_argument('--split', default='train')
+parser.add_argument('--prefix', default='scene')
 
 # 渲染设置
 parser.add_argument('--use_gpu', default=0, type=int)

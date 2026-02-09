@@ -3,6 +3,7 @@
 Build ORDINAL-SPATIAL benchmark dataset.
 
 生成指定数量的场景，物体数量在 min-max 范围内严格均分。
+多生成 ~10%，按物体数量分组裁剪到目标数量。
 无 train/val/test 划分，生成扁平数据集。
 
 Usage:
@@ -18,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# 多生成比例
+OVERSHOOT_RATIO = 0.10
 
 
 @dataclass
@@ -50,7 +55,7 @@ class BenchmarkConfig:
 
 
 class BenchmarkBuilder:
-  """数据集生成器。"""
+  """数据集生成器（扁平模式，带多生成裁剪）。"""
 
   def __init__(self, config: BenchmarkConfig):
     self.config = config
@@ -59,34 +64,82 @@ class BenchmarkBuilder:
 
   def build(self) -> Dict[str, Any]:
     """生成完整数据集。"""
+    n_levels = (
+      self.config.max_objects - self.config.min_objects + 1
+    )
+    per_level = self.config.n_scenes // n_levels
+    remainder = self.config.n_scenes % n_levels
+
     logger.info("=" * 60)
     logger.info("ORDINAL-SPATIAL Dataset Builder")
-    logger.info(f"  Scenes: {self.config.n_scenes}")
+    logger.info(f"  Target scenes: {self.config.n_scenes}")
     logger.info(
-      f"  Objects: {self.config.min_objects}-{self.config.max_objects}"
+      f"  Objects: {self.config.min_objects}"
+      f"-{self.config.max_objects} ({n_levels} levels)"
     )
+    logger.info(f"  Per level: {per_level} (+1 for first "
+                f"{remainder})" if remainder else "")
     logger.info(f"  Tau: {self.config.tau}")
     logger.info(
-      f"  Resolution: {self.config.image_width}x{self.config.image_height}"
+      f"  Resolution: "
+      f"{self.config.image_width}x{self.config.image_height}"
     )
     logger.info("=" * 60)
+
+    # 计算多生成数量
+    extra = max(
+      n_levels, int(self.config.n_scenes * OVERSHOOT_RATIO)
+    )
+    render_count = self.config.n_scenes + extra
+    logger.info(
+      f"Over-generate: {render_count} "
+      f"(+{extra} extra for trim)"
+    )
 
     # 创建目录结构
     self._create_directories()
 
     # 渲染
     logger.info(
-      f"Step 1: Rendering {self.config.n_scenes} scenes..."
+      f"Step 1: Rendering {render_count} scenes..."
     )
-    render_output = self._render()
+    render_output = self._render(render_count)
+
+    # 加载渲染结果
+    scenes_file = render_output / "scene_scenes.json"
+    if not scenes_file.exists():
+      raise RuntimeError(
+        f"Render produced no output: {scenes_file}"
+      )
+
+    with open(scenes_file) as f:
+      all_rendered = json.load(f).get("scenes", [])
+
+    if not all_rendered:
+      raise RuntimeError(
+        "Render succeeded but produced 0 scenes"
+      )
+
+    logger.info(f"  Rendered {len(all_rendered)} scenes")
+
+    # 按物体数量分组裁剪
+    logger.info("Step 2: Trimming to balanced counts...")
+    selected = self._trim_to_balanced(
+      all_rendered, per_level, remainder, n_levels
+    )
+    logger.info(f"  Selected {len(selected)} scenes")
 
     # 提取约束
-    logger.info("Step 2: Extracting ground truth constraints...")
-    constraints_data = self._extract_constraints(render_output)
+    logger.info(
+      "Step 3: Extracting ground truth constraints..."
+    )
+    constraints_data = self._extract_constraints(selected)
 
     # 整理数据集
-    logger.info("Step 3: Building dataset...")
-    dataset = self._build_dataset(render_output, constraints_data)
+    logger.info("Step 4: Building dataset...")
+    dataset = self._build_dataset(
+      render_output, selected, constraints_data
+    )
 
     # 保存数据集索引
     index_file = self.output_dir / "dataset.json"
@@ -101,6 +154,14 @@ class BenchmarkBuilder:
     if render_temp.exists():
       shutil.rmtree(render_temp)
 
+    # 打印物体数量分布
+    dist = Counter(
+      entry["n_objects"] for entry in dataset
+    )
+    logger.info("\nObject count distribution:")
+    for k in sorted(dist):
+      logger.info(f"  {k} objects: {dist[k]} scenes")
+
     logger.info("\n" + "=" * 60)
     logger.info("Dataset generation complete!")
     logger.info(f"  Output: {self.output_dir}")
@@ -108,6 +169,42 @@ class BenchmarkBuilder:
     logger.info("=" * 60)
 
     return {"n_scenes": len(dataset)}
+
+  def _trim_to_balanced(
+    self,
+    scenes: List[Dict],
+    per_level: int,
+    remainder: int,
+    n_levels: int
+  ) -> List[Dict]:
+    """
+    按物体数量分组，每组裁剪到目标数量。
+    不足的组保留全部，不补齐。
+    """
+    # 按物体数量分组
+    by_count: Dict[int, List[Dict]] = defaultdict(list)
+    for scene in scenes:
+      n = scene.get(
+        "n_objects", len(scene.get("objects", []))
+      )
+      by_count[n].append(scene)
+
+    selected = []
+    for k in range(n_levels):
+      obj_count = self.config.min_objects + k
+      target = per_level + (1 if k < remainder else 0)
+      available = by_count.get(obj_count, [])
+
+      if len(available) < target:
+        logger.warning(
+          f"  {obj_count} objects: only {len(available)}"
+          f"/{target} scenes available"
+        )
+        selected.extend(available)
+      else:
+        selected.extend(available[:target])
+
+    return selected
 
   def _create_directories(self):
     """创建目录结构。"""
@@ -119,12 +216,14 @@ class BenchmarkBuilder:
     ]:
       d.mkdir(parents=True, exist_ok=True)
 
-  def _render(self) -> Path:
-    """调用 Blender 渲染所有场景。"""
+  def _render(self, render_count: int) -> Path:
+    """调用 Blender 渲染场景。"""
     render_output = self.output_dir / "render_temp"
     render_output.mkdir(parents=True, exist_ok=True)
 
-    render_script = str(self.rendering_dir / "render_multiview.py")
+    render_script = str(
+      self.rendering_dir / "render_multiview.py"
+    )
     data_dir = self.rendering_dir / "data"
 
     cmd = [
@@ -139,8 +238,8 @@ class BenchmarkBuilder:
       "--shape_dir", str(data_dir / "shapes_v5"),
       "--material_dir", str(data_dir / "materials_v5"),
       "--output_dir", str(render_output),
-      "--split", "scene",
-      "--num_images", str(self.config.n_scenes),
+      "--prefix", "scene",
+      "--num_images", str(render_count),
       "--min_objects", str(self.config.min_objects),
       "--max_objects", str(self.config.max_objects),
       "--n_views", str(self.config.n_views),
@@ -148,7 +247,8 @@ class BenchmarkBuilder:
       "--elevation", str(self.config.elevation),
       "--width", str(self.config.image_width),
       "--height", str(self.config.image_height),
-      "--render_num_samples", str(self.config.render_samples),
+      "--render_num_samples",
+      str(self.config.render_samples),
       "--balanced_objects", "1",
       "--seed", str(self.config.random_seed),
     ]
@@ -156,7 +256,7 @@ class BenchmarkBuilder:
     if self.config.use_gpu:
       cmd.extend(["--use_gpu", "1"])
 
-    logger.info(f"Running Blender render...")
+    logger.info("Running Blender render...")
 
     try:
       result = subprocess.run(cmd, timeout=3600 * 8)
@@ -170,11 +270,13 @@ class BenchmarkBuilder:
     return render_output
 
   def _extract_constraints(
-    self, render_output: Path
+    self, scenes: List[Dict]
   ) -> Dict[str, Dict]:
     """从渲染结果中提取约束。"""
     try:
-      from ordinal_spatial.agents import BlenderConstraintAgent
+      from ordinal_spatial.agents import (
+        BlenderConstraintAgent,
+      )
     except ImportError:
       logger.warning(
         "BlenderConstraintAgent not available, "
@@ -182,18 +284,10 @@ class BenchmarkBuilder:
       )
       return {}
 
-    scenes_file = render_output / "scene_scenes.json"
-    if not scenes_file.exists():
-      logger.warning(f"Scenes file not found: {scenes_file}")
-      return {}
-
-    with open(scenes_file) as f:
-      scenes_data = json.load(f)
-
-    constraints_data = {}
     agent = BlenderConstraintAgent()
+    constraints_data = {}
 
-    for scene in scenes_data.get("scenes", []):
+    for scene in scenes:
       scene_id = scene.get("scene_id", "")
       try:
         constraint_set = agent.extract_from_single_view(
@@ -202,7 +296,8 @@ class BenchmarkBuilder:
         constraints_data[scene_id] = constraint_set.to_dict()
       except Exception as e:
         logger.warning(
-          f"Failed to extract constraints for {scene_id}: {e}"
+          f"Failed to extract constraints "
+          f"for {scene_id}: {e}"
         )
         constraints_data[scene_id] = scene.get(
           "world_constraints", {}
@@ -213,20 +308,13 @@ class BenchmarkBuilder:
   def _build_dataset(
     self,
     render_output: Path,
+    scenes: List[Dict],
     constraints_data: Dict[str, Dict]
   ) -> List[Dict]:
     """整理渲染结果到最终目录。"""
     dataset = []
 
-    scenes_file = render_output / "scene_scenes.json"
-    if not scenes_file.exists():
-      logger.error(f"Scenes file not found: {scenes_file}")
-      return dataset
-
-    with open(scenes_file) as f:
-      scenes_data = json.load(f)
-
-    for scene in scenes_data.get("scenes", []):
+    for scene in scenes:
       scene_id = scene.get("scene_id", "")
 
       # 复制多视角图片
@@ -240,7 +328,9 @@ class BenchmarkBuilder:
         shutil.copytree(src_mv, dst_mv)
 
       # 复制单视角图片
-      src_sv = render_output / "single_view" / f"{scene_id}.png"
+      src_sv = (
+        render_output / "single_view" / f"{scene_id}.png"
+      )
       dst_sv = (
         self.output_dir / "images" / "single_view"
         / f"{scene_id}.png"
@@ -260,6 +350,9 @@ class BenchmarkBuilder:
         json.dump(scene_metadata, f, indent=2)
 
       # 数据集条目
+      n_objects = scene.get(
+        "n_objects", len(scene.get("objects", []))
+      )
       multi_view_images = [
         f"images/multi_view/{scene_id}/view_{i}.png"
         for i in range(self.config.n_views)
@@ -271,9 +364,7 @@ class BenchmarkBuilder:
           f"images/single_view/{scene_id}.png",
         "multi_view_images": multi_view_images,
         "metadata_path": f"metadata/{scene_id}.json",
-        "n_objects": scene.get(
-          "n_objects", len(scene.get("objects", []))
-        ),
+        "n_objects": n_objects,
         "tau": self.config.tau,
       })
 
@@ -283,7 +374,7 @@ class BenchmarkBuilder:
     """保存数据集信息。"""
     info = {
       "name": "ORDINAL-SPATIAL Dataset",
-      "version": "1.0",
+      "version": "2.0",
       "created": datetime.now().isoformat(),
       "config": {
         "n_scenes": self.config.n_scenes,
@@ -292,7 +383,8 @@ class BenchmarkBuilder:
         "tau": self.config.tau,
         "n_views": self.config.n_views,
         "image_size": [
-          self.config.image_width, self.config.image_height
+          self.config.image_width,
+          self.config.image_height,
         ],
         "camera_distance": self.config.camera_distance,
         "elevation": self.config.elevation,
@@ -375,12 +467,19 @@ def main():
   n_levels = args.max_objects - args.min_objects + 1
   per_level = args.n_scenes // n_levels
   remainder = args.n_scenes % n_levels
-  print(f"Dataset configuration:")
+  print("Dataset configuration:")
   print(f"  Total scenes: {args.n_scenes}")
-  print(f"  Objects range: {args.min_objects}-{args.max_objects} "
-        f"({n_levels} levels)")
-  print(f"  Per level: {per_level}"
-        f" (+1 for first {remainder})" if remainder else "")
+  print(
+    f"  Objects range: {args.min_objects}"
+    f"-{args.max_objects} ({n_levels} levels)"
+  )
+  if remainder:
+    print(
+      f"  Per level: {per_level} "
+      f"(+1 for first {remainder})"
+    )
+  else:
+    print(f"  Per level: {per_level}")
   print(f"  Resolution: {args.width}x{args.height}")
   print(f"  Render samples: {args.render_samples}")
   print(f"  Tau: {args.tau}")
