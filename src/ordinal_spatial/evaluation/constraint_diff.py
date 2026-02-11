@@ -9,6 +9,17 @@ This module implements the evaluation metrics defined in the benchmark paper:
 - Violated: Constraints with flipped direction (severe errors)
 
 The metrics provide fine-grained analysis beyond simple P/R/F1.
+
+.. deprecated::
+    This module is superseded by ``evaluation.comparison`` which provides:
+    - All 7 constraint types (adds closer, trr)
+    - Canonical key normalization with pair/obj swap handling
+    - Wrong-value sub-classification (flip/shift/other)
+    - Optional GT annotation for hallucinated constraints
+    - Batch comparison and structured ComparisonResult
+
+    Use ``from ordinal_spatial.evaluation.comparison import
+    ConstraintComparator`` for new code.
 """
 
 from dataclasses import dataclass, field
@@ -187,7 +198,9 @@ def compute_constraint_diff(
         ConstraintDiffMetrics with detailed breakdown
     """
     if constraint_types is None:
-        constraint_types = ["qrr", "axial", "size", "topology"]
+        constraint_types = [
+            "qrr", "axial", "size", "topology", "occlusion",
+        ]
 
     # Initialize metrics
     metrics = ConstraintDiffMetrics()
@@ -214,6 +227,11 @@ def compute_constraint_diff(
             type_metrics = _compute_topology_diff(
                 predicted.get("topology", []),
                 ground_truth.get("topology", [])
+            )
+        elif ctype == "occlusion":
+            type_metrics = _compute_occlusion_diff(
+                predicted.get("occlusion", []),
+                ground_truth.get("occlusion", [])
             )
         else:
             continue
@@ -551,6 +569,137 @@ def _compute_topology_diff(
         )
 
     return metrics
+
+
+def _occlusion_key(constraint: Dict) -> Tuple:
+    """Create canonical key for occlusion constraint."""
+    occluder = constraint.get("occluder", "")
+    occluded = constraint.get("occluded", "")
+    return (occluder, occluded)
+
+
+def _compute_occlusion_diff(
+    predicted: List[Dict],
+    ground_truth: List[Dict]
+) -> ConstraintDiffMetrics:
+    """
+    计算遮挡约束的 Constraint-Diff。
+
+    Compute Constraint-Diff for occlusion constraints.
+    """
+    metrics = ConstraintDiffMetrics()
+
+    # 构建查找表: (occluder, occluded) 有向对
+    gt_set = set()
+    for c in ground_truth:
+        gt_set.add(_occlusion_key(c))
+
+    pred_set = set()
+    for c in predicted:
+        pred_set.add(_occlusion_key(c))
+
+    metrics.n_ground_truth = len(gt_set)
+    metrics.n_predicted = len(pred_set)
+
+    # 缺失: 在 GT 中但不在预测中
+    missing = gt_set - pred_set
+    metrics.n_missing = len(missing)
+    metrics.missing_keys = [str(k) for k in missing]
+
+    # 冗余: 在预测中但不在 GT 中
+    spurious = pred_set - gt_set
+    metrics.spurious_keys = [str(k) for k in spurious]
+
+    # 检查完全匹配和方向反转
+    matched = gt_set & pred_set
+    metrics.n_correct = len(matched)
+
+    # 反转: (A,B) 在预测中但 GT 有 (B,A)
+    violated_count = 0
+    real_spurious = set()
+    for key in spurious:
+        reversed_key = (key[1], key[0])
+        if reversed_key in gt_set:
+            violated_count += 1
+        else:
+            real_spurious.add(key)
+
+    metrics.n_violated = violated_count
+    metrics.n_spurious = len(real_spurious)
+    metrics.spurious_keys = [str(k) for k in real_spurious]
+    metrics.violated_keys = [
+        str(k) for k in spurious if (k[1], k[0]) in gt_set
+    ]
+
+    # 计算率
+    if metrics.n_ground_truth > 0:
+        metrics.missing_rate = (
+            metrics.n_missing / metrics.n_ground_truth
+        )
+        metrics.recall = (
+            metrics.n_correct / metrics.n_ground_truth
+        )
+
+    if metrics.n_predicted > 0:
+        metrics.spurious_rate = (
+            metrics.n_spurious / metrics.n_predicted
+        )
+        metrics.precision = (
+            metrics.n_correct / metrics.n_predicted
+        )
+
+    matched_total = metrics.n_correct + metrics.n_violated
+    if matched_total > 0:
+        metrics.violated_rate = (
+            metrics.n_violated / matched_total
+        )
+
+    if metrics.precision + metrics.recall > 0:
+        metrics.f1 = (
+            2 * metrics.precision * metrics.recall
+            / (metrics.precision + metrics.recall)
+        )
+
+    return metrics
+
+
+def compute_grouped_constraint_diff(
+    predicted: Dict[str, Any],
+    ground_truth: Dict[str, Any],
+) -> Dict[str, ConstraintDiffMetrics]:
+    """
+    计算分组 Constraint-Diff (view-invariant vs view-dependent)。
+
+    Compute grouped Constraint-Diff metrics:
+    - "view_invariant": qrr, topology, size
+    - "view_dependent": axial, occlusion
+    - "overall": all combined
+
+    Args:
+        predicted: Predicted constraint set dict
+        ground_truth: Ground truth constraint set dict
+
+    Returns:
+        Dict with "view_invariant", "view_dependent", "overall"
+    """
+    vi_types = ["qrr", "topology", "size"]
+    vd_types = ["axial", "occlusion"]
+
+    vi = compute_constraint_diff(
+        predicted, ground_truth, vi_types
+    )
+    vd = compute_constraint_diff(
+        predicted, ground_truth, vd_types
+    )
+    overall = compute_constraint_diff(
+        predicted, ground_truth, vi_types + vd_types
+    )
+
+    return {
+        "view_invariant": vi,
+        "view_dependent": vd,
+        "overall": overall,
+    }
 
 
 def _is_comparator_flip(pred: str, gt: str) -> bool:

@@ -363,12 +363,18 @@ class WorldConstraints(BaseModel):
     - Physical size ordering
     - 3D axial relations
     - Ternary closer relations
+    - Ternary reference relations (TRR, 3D)
+    - 3D occlusion approximation
     """
     qrr: List[QRRConstraintSchema] = Field(default_factory=list)
     topology: List[TopologyConstraint] = Field(default_factory=list)
     size: List[SizeConstraint] = Field(default_factory=list)
     closer: List[CloserConstraint] = Field(default_factory=list)
     axial: List[AxialConstraint] = Field(default_factory=list)
+    trr: List[TRRConstraintSchema] = Field(default_factory=list)
+    occlusion: List[OcclusionConstraint] = Field(
+        default_factory=list
+    )
 
 
 class ViewConstraints(BaseModel):

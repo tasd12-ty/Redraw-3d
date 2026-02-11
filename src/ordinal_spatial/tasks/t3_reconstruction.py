@@ -139,9 +139,10 @@ class T3Runner:
             gt_positions = item.get("ground_truth_positions", None)
             objects = item.get("objects", [])
 
-            # Get QRR constraints
+            # Get QRR constraints (支持 {world, views} 和扁平格式)
             if isinstance(constraints, dict):
-                qrr = constraints.get("qrr", [])
+                world = constraints.get("world", constraints)
+                qrr = world.get("qrr", [])
             elif isinstance(constraints, list):
                 qrr = constraints
             else:

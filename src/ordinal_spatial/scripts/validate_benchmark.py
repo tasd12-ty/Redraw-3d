@@ -299,14 +299,16 @@ class BenchmarkValidator:
             object_counts.append(len(objects))
 
             cs = metadata.get("constraints", {})
+            # 支持 {world, views} 和旧扁平格式
+            world = cs.get("world", cs)
             qrr_counts.append(
-              len(cs.get("qrr", []))
+              len(world.get("qrr", []))
             )
             trr_counts.append(
-              len(cs.get("trr", []))
+              len(world.get("trr", []))
             )
             axial_counts.append(
-              len(cs.get("axial", []))
+              len(world.get("axial", []))
             )
         else:
           self.report.add_error(ValidationError(

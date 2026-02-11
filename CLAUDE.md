@@ -10,7 +10,7 @@ ORDINAL-SPATIAL: 序空间推理基准评估框架。
 ### 已完成
 
 - [x] 渲染管线: Blender 5.0+ 多视角渲染（GPU/CPU）
-- [x] 扁平数据集生成: 单进程 (`os-benchmark`) + 多 GPU (`build_parallel.py`)
+- [x] 扁平数据集生成: 统一构建脚本 (`os-benchmark`，支持 CPU/单GPU/多GPU)
 - [x] 多生成+裁剪策略: 物体数量严格均分
 - [x] 数据集验证 (`os-validate`)
 - [x] DSL 核心模型: ObjectSpec, OSD, QRR/TRR 约束
@@ -23,11 +23,7 @@ ORDINAL-SPATIAL: 序空间推理基准评估框架。
 
 ### 待完成 / 已知问题
 
-- [ ] `baselines/run_baseline.py` 仍使用旧版 split 格式 — 需适配扁平模式
-- [ ] 多 GPU 并行裁剪后有孤立图片文件残留（不影响正确性，浪费磁盘）
-- [ ] `_trim_to_balanced()` 在 build_benchmark 和 multi_gpu_builder 中重复实现 — 可提取为共享工具
 - [ ] 尚未在真实 Blender 环境中跑通端到端测试
-- [ ] 评估管线 (tasks/, baselines/) 尚未与扁平数据集完全对齐
 - [ ] 感知上界 (PerceptionAgent): SAM2 + UniDepth V2 管线 — 设计完成，代码待实现
 - [ ] VLM 端到端评估: 实际调用 VLM API 进行约束提取 — 需配置 API key
 
@@ -41,16 +37,14 @@ ordinal-spatial/
 │   ├── evaluation/             # T1/T2/T3 评估指标
 │   ├── reconstruction/         # 约束求解与场景重建
 │   ├── agents/                 # VLM 约束提取智能体
-│   ├── baselines/              # 基线模型 (⚠️ 部分仍用旧 split 格式)
+│   ├── baselines/              # 基线模型
 │   ├── tasks/                  # T1/T2/T3 任务运行器
 │   ├── prompts/                # VLM 提示模板
 │   ├── rendering/              # Blender 5.0+ 渲染
 │   ├── scripts/                # CLI 脚本实现
 │   ├── cli/                    # CLI 入口
 │   └── utils/                  # 工具函数
-├── scripts/                    # 独立脚本
-│   ├── build_parallel.py       # 多 GPU 并行生成
-│   └── lib/                    # 并行构建库
+├── scripts/                    # 独立脚本 (预留)
 ├── tests/                      # 测试
 └── docs/                       # 文档
 ```
@@ -71,6 +65,22 @@ data/
 
 生成策略: 多生成 ~10% → 按 n_objects 分组 → 每组裁剪到 `n // levels` → 严格均分。
 
+元数据格式 (`metadata/scene_NNNNNN.json`):
+```json
+{
+  "scene_id": "scene_000042",
+  "objects": [...],
+  "views": [{"camera": {...}, "objects": [...]}],
+  "constraints": {
+    "world": {"qrr":[], "trr":[], "axial":[], "topology":[],
+              "size":[], "closer":[], "occlusion":[]},
+    "views": [{"camera":{}, "qrr_2d":[], "axial_2d":[],
+               "occlusion":[], "size_apparent":[]}]
+  }
+}
+```
+兼容读取: `cs.get("world", cs)` 可回退旧格式。
+
 ## 代码规范
 
 - **缩进**: 2 空格
@@ -90,13 +100,10 @@ uv sync --extra dev
 uv run pytest
 
 # CLI 工具
-uv run os-benchmark --help      # 单进程数据集生成
+uv run os-benchmark --help      # 数据集生成 (CPU/单GPU/多GPU)
 uv run os-validate --help       # 扁平数据集验证
 uv run os-baseline --help       # 基线评估
 uv run os-agent --help          # VLM 智能体
-
-# 多 GPU 并行生成
-python scripts/build_parallel.py --help
 ```
 
 ## 关键文件
@@ -106,31 +113,39 @@ python scripts/build_parallel.py --help
 | `dsl/schema.py` | 核心数据模型 (ObjectSpec, OSD, Constraints) | ✅ |
 | `dsl/predicates.py` | QRR/TRR 约束计算 | ✅ |
 | `evaluation/metrics.py` | T1/T2/T3 评估指标 | ✅ |
-| `evaluation/constraint_diff.py` | Constraint-Diff 评估 | ✅ |
+| `evaluation/comparison.py` | 约束比较引擎 (4 类错误分类) | ✅ |
+| `evaluation/constraint_diff.py` | Constraint-Diff (deprecated → comparison.py) | ⚠️ |
+| `utils/metadata.py` | 元数据格式工具 (world/views 兼容) | ✅ |
 | `agents/vlm_constraint_agent.py` | VLM 约束提取 (Task-2/3) | ✅ |
 | `agents/prompts/constraint_extraction.py` | VLM 提示词 (7 约束定义+思考角度) | ✅ |
 | `agents/blender_constraint_agent.py` | Blender 真值提取 (Task-1) | ✅ |
 | `rendering/render_multiview.py` | Blender 多视角渲染 (--prefix) | ✅ |
 | `rendering/blender_utils.py` | Blender API 封装 | ✅ |
-| `scripts/build_benchmark.py` | 单进程数据集构建 (os-benchmark) | ✅ |
+| `scripts/build_benchmark.py` | 统一数据集构建 (os-benchmark, CPU/GPU/多GPU) | ✅ |
 | `scripts/validate_benchmark.py` | 扁平数据集验证 (os-validate) | ✅ |
 | `reconstruction/pipeline.py` | 端到端重建流水线 | ✅ |
-| `baselines/run_baseline.py` | 基线评估运行器 | ⚠️ 待适配扁平模式 |
+| `baselines/run_baseline.py` | 基线评估运行器 | ✅ |
 
 ## 生成数据集
 
 ```bash
-# 单进程 (os-benchmark)
+# CPU 单进程
+uv run os-benchmark -o ./data -b $BLENDER_PATH -n 1000
+
+# 单 GPU
 uv run os-benchmark -o ./data -b $BLENDER_PATH -n 1000 --use-gpu
 
-# 多 GPU 并行
-python scripts/build_parallel.py -o ./data -n 10000 --n-gpus 4 -y
+# 多 GPU 并行 (4 卡)
+uv run os-benchmark -o ./data -b $BLENDER_PATH -n 10000 --n-gpus 4
+
+# 画质预设: draft/normal/high
+uv run os-benchmark -o ./data -b $BLENDER_PATH -n 100 --quality draft
 
 # 验证
 uv run os-validate -d ./data
 ```
 
-两条路径统一使用扁平模式，多生成 ~10% 后按物体数量裁剪到精确均分。
+统一构建脚本，多生成 ~10% 后按物体数量裁剪到精确均分。
 
 ## VLM 约束提取 (三种输入模式)
 

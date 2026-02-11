@@ -54,6 +54,7 @@ class T2Config:
     save_predictions: bool = True
     output_dir: Optional[str] = None
     save_detailed: bool = True  # Save enhanced predictions with constraint_diff
+    view_index: Optional[int] = None  # 视角索引; None=世界坐标GT
 
 
 def _qrr_key(c: Dict) -> Tuple:
@@ -207,6 +208,55 @@ def compute_constraint_diff(
     }
 
 
+def get_gt_for_view(
+    scene: Dict[str, Any],
+    view_index: int = 0,
+) -> Dict[str, Any]:
+  """
+  构建单视角评估的 GT。
+
+  视角不变约束 (qrr, topology, size, closer) 取自 world；
+  视角相关约束 (axial, occlusion, trr) 取自 views[view_index]。
+
+  Build view-specific GT for single-view evaluation.
+  View-invariant constraints come from world;
+  view-dependent constraints come from views[view_index].
+
+  Args:
+      scene: 场景数据, 含 constraints.world 和 constraints.views
+      view_index: 视角索引
+
+  Returns:
+      合并后的 GT 字典, 可直接用于 constraint_diff 评估
+  """
+  constraints = scene.get("constraints", {})
+  world = constraints.get("world", constraints)
+  views = constraints.get("views", [])
+
+  # 视角不变约束
+  gt = {
+      "qrr": world.get("qrr", []),
+      "topology": world.get("topology", []),
+      "size": world.get("size", []),
+      "closer": world.get("closer", []),
+  }
+
+  # 视角相关约束
+  if views and view_index < len(views):
+    view = views[view_index]
+    # axial_2d → axial (评估时统一为 "axial" 键)
+    gt["axial"] = view.get("axial_2d", view.get("axial", []))
+    gt["occlusion"] = view.get("occlusion", [])
+    gt["trr"] = view.get("trr", [])
+  else:
+    # Fallback: 无视角数据, 用世界坐标
+    gt["axial"] = world.get("axial", [])
+    gt["occlusion"] = world.get("occlusion", [])
+    gt["trr"] = world.get("trr", [])
+
+  return gt
+
+
 @dataclass
 class T2Result:
     """Result from T2 evaluation."""
@@ -283,9 +333,18 @@ class T2Runner:
             }
 
             # Get ground truth first (needed for constraint_diff)
-            gt = item.get("ground_truth", item.get("constraints", {}))
-            gt_qrr = gt.get("qrr", scene.get("constraints", {}).get("qrr", []))
-            gt_trr = gt.get("trr", scene.get("constraints", {}).get("trr", []))
+            if self.config.view_index is not None:
+                gt = get_gt_for_view(scene, self.config.view_index)
+            else:
+                gt = item.get(
+                    "ground_truth", item.get("constraints", {})
+                )
+            gt_qrr = gt.get(
+                "qrr", scene.get("constraints", {}).get("qrr", [])
+            )
+            gt_trr = gt.get(
+                "trr", scene.get("constraints", {}).get("trr", [])
+            )
 
             gt_record = {
                 "scene_id": scene_id,

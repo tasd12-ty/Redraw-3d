@@ -40,24 +40,36 @@ logger = logging.getLogger(__name__)
 
 def load_dataset(data_path: str, split: str = "test_iid") -> List[Dict]:
     """
-    加载数据集划分。
+    加载数据集。
 
-    Load dataset split.
+    Load dataset. Supports:
+    1. Flat mode: data_path/dataset.json (list of scene entries)
+    2. Legacy split mode: data_path/splits/{split}.json
+    3. Direct JSON file path
     """
     path = Path(data_path)
 
-    # Try splits directory
+    # Flat mode: dataset.json
+    flat_file = path / "dataset.json"
+    if flat_file.exists():
+        with open(flat_file) as f:
+            return json.load(f)
+
+    # Legacy split mode
     split_file = path / "splits" / f"{split}.json"
     if split_file.exists():
         with open(split_file) as f:
             return json.load(f)
 
-    # Try direct file
-    if path.suffix == ".json":
+    # Direct file
+    if path.suffix == ".json" and path.exists():
         with open(path) as f:
             return json.load(f)
 
-    raise FileNotFoundError(f"Dataset not found: {data_path}/{split}")
+    raise FileNotFoundError(
+        f"Dataset not found: tried {flat_file}, "
+        f"{split_file}, {path}"
+    )
 
 
 def preprocess_for_t1_qrr(
@@ -85,12 +97,10 @@ def preprocess_for_t1_qrr(
         objects = meta.get("objects", [])
 
         # Get QRR constraints from metadata
-        constraints = meta.get("constraints", {})
-        if isinstance(constraints, dict):
-            constraint_data = constraints.get("constraints", {})
-            qrr_list = constraint_data.get("qrr", [])
-        else:
-            qrr_list = []
+        # 支持 {world, views} 和旧扁平格式
+        cs = meta.get("constraints", {})
+        world = cs.get("world", cs)
+        qrr_list = world.get("qrr", [])
 
         # Convert to queries
         queries = []
@@ -150,9 +160,10 @@ def preprocess_for_t2(
         # Get objects
         objects = meta.get("objects", [])
 
-        # Get ground truth constraints (nested structure: constraints.constraints.qrr)
-        constraints_wrapper = meta.get("constraints", {})
-        constraints = constraints_wrapper.get("constraints", {})
+        # Get ground truth constraints
+        # 支持 {world, views} 和旧扁平格式
+        cs = meta.get("constraints", {})
+        constraints = cs.get("world", cs)
 
         # Extract image filename
         image_path = item.get("single_view_image", "")
