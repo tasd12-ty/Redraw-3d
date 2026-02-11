@@ -151,7 +151,8 @@ class VLMConstraintAgent(ConstraintAgent):
         messages = self._build_messages(prompts, [image])
 
         # Call VLM
-        response = self._call_api(messages)
+        max_tokens = self._resolve_max_tokens(objects)
+        response = self._call_api(messages, max_tokens=max_tokens)
 
         # Parse response
         result = self._parse_response(response)
@@ -159,6 +160,7 @@ class VLMConstraintAgent(ConstraintAgent):
         # Add metadata
         result.metadata["mode"] = "single_view"
         result.metadata["tau"] = tau
+        result.metadata["model"] = self.config.model
 
         # Validate if configured
         if self.config.validate_consistency:
@@ -194,7 +196,8 @@ class VLMConstraintAgent(ConstraintAgent):
         messages = self._build_messages(prompts, images)
 
         # Call VLM
-        response = self._call_api(messages)
+        max_tokens = self._resolve_max_tokens(objects)
+        response = self._call_api(messages, max_tokens=max_tokens)
 
         # Parse response
         result = self._parse_response(response)
@@ -203,6 +206,7 @@ class VLMConstraintAgent(ConstraintAgent):
         result.metadata["mode"] = "multi_view"
         result.metadata["n_views"] = len(images)
         result.metadata["tau"] = tau
+        result.metadata["model"] = self.config.model
 
         # Validate if configured
         if self.config.validate_consistency:
@@ -234,6 +238,12 @@ class VLMConstraintAgent(ConstraintAgent):
 
         # Add all images
         for i, image in enumerate(images):
+            # 多视角输入时，为每张图添加视角标签以减少歧义
+            if len(images) > 1:
+                user_content.append({
+                    "type": "text",
+                    "text": f"View {i}:"
+                })
             image_data = self._encode_image(image)
             user_content.append({
                 "type": "image_url",
@@ -256,6 +266,28 @@ class VLMConstraintAgent(ConstraintAgent):
 
         return messages
 
+    def _resolve_max_tokens(
+        self,
+        objects: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """
+        根据物体数量动态设置输出 token 上限。
+
+        Resolve max_tokens by object count.
+        """
+        if not objects:
+            return self.config.max_tokens
+
+        n_objects = len(objects)
+        if n_objects <= 5:
+            computed = 4096
+        elif n_objects <= 8:
+            computed = 8192
+        else:
+            computed = 16384
+        # 不低于用户配置值，避免缩减用户显式设置的上限
+        return max(self.config.max_tokens, computed)
+
     def _encode_image(self, image: Union[str, Path, bytes]) -> str:
         """
         将图像编码为 base64。
@@ -274,7 +306,11 @@ class VLMConstraintAgent(ConstraintAgent):
         else:
             raise ValueError(f"Invalid image type: {type(image)}")
 
-    def _call_api(self, messages: List[Dict]) -> str:
+    def _call_api(
+        self,
+        messages: List[Dict],
+        max_tokens: Optional[int] = None,
+    ) -> str:
         """
         调用 VLM API。
 
@@ -290,7 +326,7 @@ class VLMConstraintAgent(ConstraintAgent):
                     model=self.config.model,
                     messages=messages,
                     temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
+                    max_tokens=max_tokens or self.config.max_tokens,
                 )
                 return response.choices[0].message.content
 
@@ -312,6 +348,7 @@ class VLMConstraintAgent(ConstraintAgent):
         """
         try:
             data = self._extract_json(response)
+            data = self._normalize_response_data(data)
             return self._build_constraint_set(data)
 
         except Exception as e:
@@ -321,6 +358,28 @@ class VLMConstraintAgent(ConstraintAgent):
                 confidence=0.0,
                 metadata={"parse_error": str(e), "raw_response": response}
             )
+
+    def _normalize_response_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        规范化模型输出，补齐关键缺省字段。
+
+        Normalize model response and fill required defaults.
+        """
+        constraints = data.get("constraints")
+        if not isinstance(constraints, dict):
+            return data
+
+        qrr_constraints = constraints.get("qrr")
+        if not isinstance(qrr_constraints, list):
+            return data
+
+        for item in qrr_constraints:
+            if not isinstance(item, dict):
+                continue
+            metric = item.get("metric")
+            if not metric:
+                item["metric"] = "dist3D"
+        return data
 
     def _extract_json(self, text: str) -> Dict:
         """
