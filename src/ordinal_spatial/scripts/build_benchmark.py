@@ -6,6 +6,11 @@ Build ORDINAL-SPATIAL benchmark dataset (unified single/multi-GPU).
 多生成 ~10%，按物体数量分组裁剪到目标数量。
 无 train/val/test 划分，生成扁平数据集。
 
+支持分批渲染 + 断点续跑:
+  --batch-size 50        每批渲染 50 个场景
+  --resume               断点续跑 (跳过已完成的 batch)
+  --timeout-per-scene 120  每场景超时 120 秒
+
 支持 CPU / 单 GPU / 多 GPU 模式:
   --n-gpus 0  → CPU 渲染 (单进程)
   --n-gpus 1  → 单 GPU 渲染
@@ -14,10 +19,13 @@ Build ORDINAL-SPATIAL benchmark dataset (unified single/multi-GPU).
 Usage:
     uv run os-benchmark -o ./data -b /path/to/blender -n 1000
     uv run os-benchmark -o ./data -b /path/to/blender -n 1000 \
-        --n-gpus 4 --quality normal --use-gpu
+        --batch-size 50 --resume
+    uv run os-benchmark -o ./data -b /path/to/blender -n 1000 \
+        --n-gpus 4 --quality normal
 """
 
 import argparse
+import glob
 import hashlib
 import json
 import logging
@@ -68,6 +76,9 @@ class BenchmarkConfig:
   n_gpus: int = 0
   render_samples: int = 256
   random_seed: int = 42
+  batch_size: int = 50
+  resume: bool = False
+  timeout_per_scene: int = 120
 
 
 def _get_rendering_dir() -> Path:
@@ -75,26 +86,27 @@ def _get_rendering_dir() -> Path:
   return Path(__file__).parent.parent / "rendering"
 
 
-# =============================================================================
+# =============================================================
 # Module-level worker function (pickle-safe for multiprocessing)
-# =============================================================================
+# =============================================================
 
 def _run_render_worker(task: Dict[str, Any]) -> Dict[str, Any]:
   """
-  单个渲染 worker (module-level, 可被 pickle)。
+  单个渲染 batch (module-level, 可被 pickle)。
 
-  每个 worker 调用 Blender 渲染一批场景, 然后提取约束。
+  每个 batch 调用一次 Blender 渲染一批场景。
 
   Args:
-    task: 渲染任务配置
+    task: 渲染任务配置 (含 batch_id, batch_output_dir 等)
 
   Returns:
-    渲染结果, 含 output_path 和约束
+    渲染结果, 含 output_path
   """
-  worker_id = task["worker_id"]
+  batch_id = task["batch_id"]
   gpu_id = task["gpu_id"]
   use_gpu = task["use_gpu"]
   prefix = task["prefix"]
+  n_scenes = task["n_scenes"]
 
   # 设置 CUDA 设备
   if use_gpu and gpu_id >= 0:
@@ -102,17 +114,15 @@ def _run_render_worker(task: Dict[str, Any]) -> Dict[str, Any]:
 
   mode = f"GPU {gpu_id}" if use_gpu else "CPU"
   logger.info(
-    f"Worker {worker_id} ({mode}): "
-    f"Rendering {task['n_scenes']} scenes "
+    f"Batch {batch_id} ({mode}): "
+    f"Rendering {n_scenes} scenes "
     f"(idx {task['start_idx']}~"
-    f"{task['start_idx'] + task['n_scenes'] - 1})"
+    f"{task['start_idx'] + n_scenes - 1})"
   )
 
-  # 准备输出目录
-  render_output = (
-    Path(task["output_dir"]) / f"worker{worker_id}_temp"
-  )
-  render_output.mkdir(parents=True, exist_ok=True)
+  # 准备 batch 输出目录
+  batch_output = Path(task["batch_output_dir"])
+  batch_output.mkdir(parents=True, exist_ok=True)
 
   # 构建 Blender 命令
   rendering_dir = _get_rendering_dir()
@@ -132,9 +142,9 @@ def _run_render_worker(task: Dict[str, Any]) -> Dict[str, Any]:
     str(data_dir / "properties.json"),
     "--shape_dir", str(data_dir / "shapes_v5"),
     "--material_dir", str(data_dir / "materials_v5"),
-    "--output_dir", str(render_output),
+    "--output_dir", str(batch_output),
     "--prefix", prefix,
-    "--num_images", str(task["n_scenes"]),
+    "--num_images", str(n_scenes),
     "--start_idx", str(task["start_idx"]),
     "--min_objects", str(task["min_objects"]),
     "--max_objects", str(task["max_objects"]),
@@ -149,39 +159,48 @@ def _run_render_worker(task: Dict[str, Any]) -> Dict[str, Any]:
     "--seed", str(task["seed"]),
   ]
 
+  # 超时 = max(5分钟, timeout_per_scene * n_scenes)
+  timeout = max(
+    300, task["timeout_per_scene"] * n_scenes
+  )
+
   # 执行渲染
   start_time = time.time()
   try:
-    result = subprocess.run(
-      cmd, timeout=3600 * 8,
-    )
+    result = subprocess.run(cmd, timeout=timeout)
     if result.returncode != 0:
       raise RuntimeError(
-        f"Worker {worker_id} render failed"
+        f"Batch {batch_id} render failed "
+        f"(returncode={result.returncode})"
       )
     elapsed = time.time() - start_time
     logger.info(
-      f"Worker {worker_id}: Done ({elapsed:.1f}s)"
+      f"Batch {batch_id}: Done ({elapsed:.1f}s, "
+      f"{elapsed / max(n_scenes, 1):.1f}s/scene)"
     )
   except subprocess.TimeoutExpired:
-    logger.error(f"Worker {worker_id}: Timeout")
+    elapsed = time.time() - start_time
+    logger.error(
+      f"Batch {batch_id}: Timeout after {elapsed:.0f}s "
+      f"(limit={timeout}s)"
+    )
     raise
 
   return {
-    "worker_id": worker_id,
-    "output_path": str(render_output),
+    "batch_id": batch_id,
+    "output_path": str(batch_output),
     "prefix": prefix,
-    "n_scenes": task["n_scenes"],
+    "n_scenes": n_scenes,
     "render_time": time.time() - start_time,
   }
 
 
-# =============================================================================
+# =============================================================
 # Builder
-# =============================================================================
+# =============================================================
 
 class BenchmarkBuilder:
-  """统一数据集生成器 (单进程 / 多 GPU 并行)。"""
+  """统一数据集生成器 (分批渲染 + 断点续跑)。"""
 
   def __init__(self, config: BenchmarkConfig):
     self.config = config
@@ -219,6 +238,12 @@ class BenchmarkBuilder:
     logger.info(
       f"  Workers: {self.n_workers}"
     )
+    logger.info(
+      f"  Batch size: {self.config.batch_size}"
+    )
+    logger.info(
+      f"  Resume: {self.config.resume}"
+    )
     logger.info("=" * 60)
 
     # 计算多生成数量
@@ -234,27 +259,63 @@ class BenchmarkBuilder:
     # 创建目录结构
     self._create_directories()
 
-    # 渲染
-    start_time = time.time()
+    # 创建所有 batch 任务
+    all_tasks = self._create_batch_tasks(render_count)
+    n_total_batches = len(all_tasks)
     logger.info(
       f"Step 1: Rendering {render_count} scenes "
-      f"with {self.n_workers} worker(s)..."
+      f"in {n_total_batches} batches "
+      f"({self.n_workers} worker(s))..."
     )
-    if self.n_workers == 1:
-      worker_results = [
-        self._render_single(render_count)
-      ]
-    else:
-      worker_results = self._render_parallel(
-        render_count
+
+    # Resume: 过滤已完成的 batch
+    if self.config.resume:
+      all_tasks = self._filter_completed_batches(
+        all_tasks
       )
+      n_skip = n_total_batches - len(all_tasks)
+      if n_skip > 0:
+        logger.info(
+          f"  Resume: skipping {n_skip} "
+          f"completed batches"
+        )
+      if not all_tasks:
+        logger.info("  All batches already complete")
+
+    # 执行渲染
+    start_time = time.time()
+    if all_tasks:
+      if self.n_workers == 1:
+        # 单进程: 逐 batch 执行
+        for i, task in enumerate(all_tasks):
+          logger.info(
+            f"  [{i + 1}/{len(all_tasks)}] "
+            f"Batch {task['batch_id']}..."
+          )
+          try:
+            _run_render_worker(task)
+          except (RuntimeError, subprocess.TimeoutExpired) as e:
+            logger.error(f"  Batch {task['batch_id']} failed: {e}")
+            logger.info("  Continuing with next batch...")
+            continue
+      else:
+        # 多 GPU: 并行执行所有 batch
+        logger.info(
+          f"  Launching {len(all_tasks)} batches "
+          f"on {self.n_workers} GPU(s)..."
+        )
+        with mp.Pool(processes=self.n_workers) as pool:
+          pool.map(_run_render_worker, all_tasks)
 
     render_time = time.time() - start_time
-    logger.info(f"  Render completed in {render_time:.0f}s")
+    if all_tasks:
+      logger.info(
+        f"  Render completed in {render_time:.0f}s"
+      )
 
-    # 收集所有场景
+    # 从所有 batch 目录收集场景
     logger.info("Step 2: Collecting scenes...")
-    all_scenes = self._collect_scenes(worker_results)
+    all_scenes = self._collect_scenes_from_batches()
     logger.info(f"  Collected {len(all_scenes)} scenes")
 
     if not all_scenes:
@@ -276,7 +337,7 @@ class BenchmarkBuilder:
     # 整理数据集
     logger.info("Step 5: Building dataset...")
     dataset = self._build_dataset(
-      worker_results, selected, constraints_data
+      selected, constraints_data
     )
 
     # 保存数据集索引
@@ -288,10 +349,7 @@ class BenchmarkBuilder:
     self._save_dataset_info(len(dataset))
 
     # 清理临时文件
-    for result in worker_results:
-      temp_dir = Path(result["output_path"])
-      if temp_dir.exists():
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    self._cleanup_temp_dirs()
 
     # 打印物体数量分布
     dist = Counter(
@@ -312,125 +370,162 @@ class BenchmarkBuilder:
     return {"n_scenes": len(dataset)}
 
   # -----------------------------------------------------------
-  # Rendering
+  # Batch Task Creation
   # -----------------------------------------------------------
 
-  def _render_single(
-    self, render_count: int
-  ) -> Dict[str, Any]:
-    """单进程渲染 (CPU 或 单 GPU)。"""
-    task = self._make_task(
-      worker_id=0,
-      gpu_id=0 if self.config.use_gpu else -1,
-      start_idx=0,
-      n_scenes=render_count,
-    )
-    return _run_render_worker(task)
-
-  def _render_parallel(
+  def _create_batch_tasks(
     self, render_count: int
   ) -> List[Dict[str, Any]]:
-    """多 GPU 并行渲染。"""
-    tasks = self._create_tasks(render_count)
-    logger.info(f"Launching {len(tasks)} worker(s)...")
+    """
+    将 render_count 切分为多个 batch 任务。
 
-    with mp.Pool(processes=len(tasks)) as pool:
-      results = pool.map(_run_render_worker, tasks)
-
-    return results
-
-  def _make_task(
-    self,
-    worker_id: int,
-    gpu_id: int,
-    start_idx: int,
-    n_scenes: int,
-    seed: Optional[int] = None,
-  ) -> Dict[str, Any]:
-    """构建单个渲染任务配置。"""
-    return {
-      "worker_id": worker_id,
-      "gpu_id": gpu_id,
-      "use_gpu": self.config.use_gpu,
-      "prefix": "scene",
-      "start_idx": start_idx,
-      "n_scenes": n_scenes,
-      "min_objects": self.config.min_objects,
-      "max_objects": self.config.max_objects,
-      "tau": self.config.tau,
-      "blender_path": self.config.blender_path,
-      "output_dir": str(self.output_dir),
-      "n_views": self.config.n_views,
-      "camera_distance": self.config.camera_distance,
-      "elevation": self.config.elevation,
-      "width": self.config.image_width,
-      "height": self.config.image_height,
-      "render_samples": self.config.render_samples,
-      "seed": seed or self.config.random_seed,
-    }
-
-  def _create_tasks(
-    self, render_count: int
-  ) -> List[Dict[str, Any]]:
-    """为多 GPU 模式创建渲染任务。"""
+    每个 batch 输出到独立子目录, 多 GPU 时 round-robin 分配。
+    """
     tasks = []
-    effective = min(self.n_workers, render_count)
-    per_worker = render_count // effective
-    remainder = render_count % effective
-    start_idx = 0
+    batch_size = self.config.batch_size
+    batch_id = 0
 
-    for wid in range(effective):
-      n = per_worker + (1 if wid < remainder else 0)
-      if n == 0:
-        continue
+    for start in range(0, render_count, batch_size):
+      n = min(batch_size, render_count - start)
+
+      # 多 GPU: round-robin 分配
+      gpu_id = (
+        batch_id % self.n_workers
+        if self.config.use_gpu else -1
+      )
+      worker_id = gpu_id if gpu_id >= 0 else 0
 
       # 确定性种子
       seed_hash = int.from_bytes(
         hashlib.sha256(
-          f"scene_{start_idx}".encode()
+          f"batch_{batch_id}_{start}".encode()
         ).digest()[:4],
         'little',
       )
-      worker_seed = self.config.random_seed + seed_hash
+      seed = self.config.random_seed + seed_hash
 
-      tasks.append(self._make_task(
-        worker_id=wid,
-        gpu_id=wid,
-        start_idx=start_idx,
-        n_scenes=n,
-        seed=worker_seed,
-      ))
-      start_idx += n
+      # batch 输出目录
+      batch_dir = (
+        self.output_dir
+        / f"worker{worker_id}_temp"
+        / f"batch_{batch_id:03d}"
+      )
+
+      task = {
+        "batch_id": batch_id,
+        "worker_id": worker_id,
+        "gpu_id": gpu_id,
+        "use_gpu": self.config.use_gpu,
+        "prefix": "scene",
+        "start_idx": start,
+        "n_scenes": n,
+        "min_objects": self.config.min_objects,
+        "max_objects": self.config.max_objects,
+        "tau": self.config.tau,
+        "blender_path": self.config.blender_path,
+        "batch_output_dir": str(batch_dir),
+        "n_views": self.config.n_views,
+        "camera_distance": self.config.camera_distance,
+        "elevation": self.config.elevation,
+        "width": self.config.image_width,
+        "height": self.config.image_height,
+        "render_samples": self.config.render_samples,
+        "seed": seed,
+        "timeout_per_scene":
+          self.config.timeout_per_scene,
+      }
+      tasks.append(task)
+      batch_id += 1
 
     return tasks
+
+  def _filter_completed_batches(
+    self, tasks: List[Dict[str, Any]]
+  ) -> List[Dict[str, Any]]:
+    """
+    Resume: 过滤已完成的 batch。
+
+    完成判断: batch 目录下 scene_scenes.json 存在
+    且场景数 >= 预期数量。
+    部分完成的 batch 清除后重渲。
+    """
+    remaining = []
+    for task in tasks:
+      batch_dir = Path(task["batch_output_dir"])
+      scenes_file = (
+        batch_dir / f"{task['prefix']}_scenes.json"
+      )
+
+      if scenes_file.exists():
+        try:
+          with open(scenes_file) as f:
+            data = json.load(f)
+          n_done = len(data.get("scenes", []))
+          if n_done >= task["n_scenes"]:
+            logger.info(
+              f"  Batch {task['batch_id']}: "
+              f"skip ({n_done} scenes complete)"
+            )
+            continue
+          else:
+            # 部分完成 → 清除重渲
+            logger.info(
+              f"  Batch {task['batch_id']}: "
+              f"partial ({n_done}/{task['n_scenes']})"
+              f", re-rendering"
+            )
+        except (json.JSONDecodeError, KeyError):
+          logger.warning(
+            f"  Batch {task['batch_id']}: "
+            f"corrupt scenes file, re-rendering"
+          )
+
+      # 清除不完整的 batch 目录
+      if batch_dir.exists():
+        shutil.rmtree(batch_dir, ignore_errors=True)
+      remaining.append(task)
+
+    return remaining
 
   # -----------------------------------------------------------
   # Scene Collection & Trimming
   # -----------------------------------------------------------
 
-  def _collect_scenes(
-    self, worker_results: List[Dict[str, Any]]
+  def _collect_scenes_from_batches(
+    self,
   ) -> List[Dict]:
-    """从所有 worker 收集渲染场景。"""
+    """从所有 batch 目录收集渲染场景。"""
     all_scenes = []
-    for result in worker_results:
-      output = Path(result["output_path"])
-      prefix = result.get("prefix", "scene")
-      scenes_file = output / f"{prefix}_scenes.json"
+    pattern = str(
+      self.output_dir / "worker*_temp" / "batch_*"
+    )
 
+    for batch_dir in sorted(glob.glob(pattern)):
+      batch_path = Path(batch_dir)
+      # 查找 scene_scenes.json
+      scenes_file = batch_path / "scene_scenes.json"
       if not scenes_file.exists():
+        # 尝试其他 prefix
+        candidates = list(
+          batch_path.glob("*_scenes.json")
+        )
+        if candidates:
+          scenes_file = candidates[0]
+        else:
+          continue
+
+      try:
+        with open(scenes_file) as f:
+          scenes = json.load(f).get("scenes", [])
+      except (json.JSONDecodeError, KeyError):
         logger.warning(
-          f"Worker {result['worker_id']}: "
-          f"Scene file not found: {scenes_file}"
+          f"  Skipping corrupt: {scenes_file}"
         )
         continue
 
-      with open(scenes_file) as f:
-        scenes = json.load(f).get("scenes", [])
-
-      # 标记来源 worker, 用于后续图片复制
+      # 标记来源 batch, 用于后续图片复制
       for scene in scenes:
-        scene["_source_output"] = str(output)
+        scene["_source_output"] = str(batch_path)
       all_scenes.extend(scenes)
 
     return all_scenes
@@ -524,7 +619,6 @@ class BenchmarkBuilder:
 
   def _build_dataset(
     self,
-    worker_results: List[Dict[str, Any]],
     scenes: List[Dict],
     constraints_data: Dict[str, Dict]
   ) -> List[Dict]:
@@ -609,6 +703,13 @@ class BenchmarkBuilder:
     ]:
       d.mkdir(parents=True, exist_ok=True)
 
+  def _cleanup_temp_dirs(self):
+    """清理所有临时 batch 目录。"""
+    pattern = str(self.output_dir / "worker*_temp")
+    for temp_dir in glob.glob(pattern):
+      if Path(temp_dir).exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
   def _save_dataset_info(self, n_scenes: int):
     """保存数据集信息。"""
     info = {
@@ -622,6 +723,7 @@ class BenchmarkBuilder:
         "tau": self.config.tau,
         "n_views": self.config.n_views,
         "n_gpus": self.config.n_gpus,
+        "batch_size": self.config.batch_size,
         "image_size": [
           self.config.image_width,
           self.config.image_height,
@@ -710,6 +812,20 @@ def main():
     help="Render quality preset (default: draft)"
   )
 
+  # 分批 + 续跑
+  parser.add_argument(
+    "--batch-size", type=int, default=50,
+    help="Scenes per Blender subprocess (default: 50)"
+  )
+  parser.add_argument(
+    "--resume", action="store_true",
+    help="Resume from checkpoint (skip completed batches)"
+  )
+  parser.add_argument(
+    "--timeout-per-scene", type=int, default=120,
+    help="Timeout per scene in seconds (default: 120)"
+  )
+
   # 相机设置
   parser.add_argument(
     "--camera-distance", type=float, default=12.0
@@ -734,10 +850,13 @@ def main():
   # 打印配置
   n_levels = args.max_objects - args.min_objects + 1
   per_level = args.n_scenes // n_levels
-  remainder = args.n_scenes % n_levels
   device = (
     f"{args.n_gpus} GPU(s)" if use_gpu
     else "CPU"
+  )
+  n_batches = (
+    (args.n_scenes + int(args.n_scenes * OVERSHOOT_RATIO))
+    // args.batch_size + 1
   )
 
   print("\n" + "=" * 60)
@@ -755,6 +874,16 @@ def main():
   print(f"Samples   : {samples}")
   print(f"Device    : {device}")
   print(f"Tau       : {args.tau}")
+  print(
+    f"Batch     : {args.batch_size} scenes/batch "
+    f"(~{n_batches} batches)"
+  )
+  print(
+    f"Timeout   : {args.timeout_per_scene}s/scene "
+    f"({args.timeout_per_scene * args.batch_size}s/batch)"
+  )
+  if args.resume:
+    print("Resume    : enabled")
   print("=" * 60 + "\n")
 
   config = BenchmarkConfig(
@@ -773,6 +902,9 @@ def main():
     n_gpus=args.n_gpus,
     render_samples=samples,
     random_seed=args.seed,
+    batch_size=args.batch_size,
+    resume=args.resume,
+    timeout_per_scene=args.timeout_per_scene,
   )
 
   builder = BenchmarkBuilder(config)
